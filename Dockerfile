@@ -12,8 +12,10 @@ FROM docker.io/library/debian:12
 #     .deb directly -- no makepkg, no AUR, no third-party repack.
 #   * The .deb is pinned by sha512 (taken from the official AUR PKGBUILD,
 #     which mirrors Tencent's own published artifact).
-#   * Architectures: linuxqq only ships x86_64 here, so the image is built
-#     for linux/amd64 and runs under Rosetta (see ../run.sh).
+#   * Architectures: Tencent ships both x86_64 and aarch64 .deb files for the
+#     same version. Pick one with `./qq.sh --arch amd64|arm64`; amd64 runs under
+#     Rosetta, arm64 is native (and does not need Rosetta).
+#   * Which package is installed is controlled by ./qq.sh --pkg url|local|apt.
 #   * No X11 socket bind-mount: macOS has no /tmp/.X11-unix. X11 is done over
 #     TCP to XQuartz on the host (see entrypoint.sh).
 # ---------------------------------------------------------------------------
@@ -54,17 +56,50 @@ RUN sed -i 's/^# *\(zh_CN.UTF-8\)/\1/' /etc/locale.gen 2>/dev/null || true; \
     && sed -i 's/^# *\(zh_CN\.UTF-8\)/\1/' /etc/locale.gen \
     && locale-gen && rm -rf /var/lib/apt/lists/*
 
-# --- install linuxqq from Tencent's official package -----------------------
+# --- install linuxqq -------------------------------------------------------
+# Three sources, chosen by qq.sh --pkg:
+#
+#   url   (default) Tencent's official package, pinned by sha512. The amd64
+#                   artifact is the one the AUR PKGBUILD mirrors; the arm64 one
+#                   is served from the QQNT CDN. Both were verified to exist.
+#   local           a .deb the caller already has. qq.sh stages it as
+#                   .qq-local-package.deb in the build context.
+#   apt             whatever the distro repo carries (linuxqq). Not Tencent's
+#                   official build, and not version-pinned, but requires no
+#                   download from a third-party mirror.
 ARG LINUXQQ_URL=https://mirrors.sdu.edu.cn/spark-store-repository/store/chat/linuxqq/linuxqq_3.2.34-53644_amd64.deb
 ARG LINUXQQ_SHA512=774e45cd7238dc51b31c02ee494f9f86e773c487a90851790a806f776e130af125110045844e90dd68d0b073dc53bdd4d1c6d8fb7225b8f214fc0e35d1a20e32
+ARG LINUXQQ_LOCAL=
+ARG LINUXQQ_FROM_APT=0
 
+# Stage the local package (if any). Docker's COPY fails outright when a glob
+# matches nothing, so qq.sh always writes a placeholder file first; the real
+# package just overwrites it. The directory other-than-that stays empty for
+# the url/apt modes and the branches below ignore it.
+COPY .qq-local-package.deb* /tmp/local-qq/
 RUN set -eux; \
-    curl -fL --retry 5 --retry-delay 3 -o /tmp/linuxqq.deb "$LINUXQQ_URL"; \
-    echo "${LINUXQQ_SHA512}  /tmp/linuxqq.deb" | sha512sum -c -; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends /tmp/linuxqq.deb; \
-    rm -f /tmp/linuxqq.deb; \
-    rm -rf /var/lib/apt/lists/*; \
+    if [ "$LINUXQQ_FROM_APT" = "1" ]; then \
+        echo 'installing linuxqq from the distro repository'; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends linuxqq; \
+    elif [ -n "$LINUXQQ_LOCAL" ] && [ -f "/tmp/local-qq/$LINUXQQ_LOCAL" ]; then \
+        echo "installing local package $LINUXQQ_LOCAL"; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends "/tmp/local-qq/$LINUXQQ_LOCAL"; \
+    elif [ "$LINUXQQ_LOCAL" = "ondisk" ] && ls /tmp/local-qq/*.deb >/dev/null 2>&1; then \
+        # Fallback: a .deb was staged but the name was not propagated.
+        deb="$(ls /tmp/local-qq/*.deb | head -1)"; \
+        echo "installing staged package $deb"; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends "$deb"; \
+    else \
+        echo "downloading $LINUXQQ_URL"; \
+        curl -fL --retry 5 --retry-delay 3 -o /tmp/linuxqq.deb "$LINUXQQ_URL"; \
+        echo "${LINUXQQ_SHA512}  /tmp/linuxqq.deb" | sha512sum -c -; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends /tmp/linuxqq.deb; \
+    fi; \
+    rm -f /tmp/linuxqq.deb; rm -rf /tmp/local-qq /var/lib/apt/lists/*; \
     # sanity: the Electron binary must be present and executable
     test -x /opt/QQ/qq; \
     /opt/QQ/qq --version 2>/dev/null || true

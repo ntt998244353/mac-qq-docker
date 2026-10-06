@@ -20,8 +20,40 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# ---------------------------------------------------------------------------
+# options (all optional; qq.sh passes these through)
+# ---------------------------------------------------------------------------
+# Defaults preserve the original behaviour when the script is run directly.
 CONTAINER_NAME="${CONTAINER_NAME:-qq-wayland}"
 IMAGE="${IMAGE:-mac-qq-docker:latest}"
+ARCH="${QQ_ARCH:-amd64}"
+ROSETTA="${QQ_ROSETTA:-1}"
+CPUS="${QQ_CPUS:-4}"
+MEMORY="${QQ_MEMORY:-3G}"
+IME="${QQ_ENABLE_IME:-0}"
+EXTRA_ARGS="${QQ_EXTRA_ARGS:-}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name)       CONTAINER_NAME="$2"; shift 2 ;;
+        --image)      IMAGE="$2";          shift 2 ;;
+        --arch)       ARCH="$2";           shift 2 ;;
+        --cpus)       CPUS="$2";           shift 2 ;;
+        --memory)     MEMORY="$2";         shift 2 ;;
+        --ime)        IME="$2";            shift 2 ;;
+        --extra-args) EXTRA_ARGS="$2";     shift 2 ;;
+        --no-rosetta) ROSETTA=0;            shift   ;;
+        -*)
+            printf 'error: unknown option for wayland-launch.sh: %s\n' "$1" >&2
+            exit 2 ;;
+        *)
+            printf 'error: unexpected argument: %s\n' "$1" >&2
+            exit 2 ;;
+    esac
+done
+
+[ "$ARCH" = "arm64" ] && PLATFORM="linux/arm64" || PLATFORM="linux/amd64"
+
 RUNTIME_DIR="/tmp/cocoa-way-qq"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -103,11 +135,19 @@ trap cleanup EXIT INT TERM
 # which is why the relay script must be the container's first process.
 # It listens on both ends and reports readiness on stdout before QQ starts.
 
-log "starting container '$CONTAINER_NAME'"
+log "starting container '$CONTAINER_NAME' ($ARCH)"
+# --rosetta is only added for amd64: the vz backend cannot run a foreign arch
+# without it, and adding it for a native arm64 guest would be pointless.
+rosetta_flag=()
+if [ "$ROSETTA" = "1" ] && [ "$ARCH" = "amd64" ]; then
+    rosetta_flag=(--rosetta)
+fi
+# ${arr[@]} on an empty array trips `set -u` on bash 3.2 (the macOS default),
+# so expand it only when it has an element.
 container run --rm \
     --name "$CONTAINER_NAME" \
-    --arch amd64 --platform linux/amd64 --rosetta \
-    --cpus "${QQ_CPUS:-4}" --memory "${QQ_MEMORY:-3G}" \
+    --arch "$ARCH" --platform "$PLATFORM" ${rosetta_flag[@]+"${rosetta_flag[@]}"} \
+    --cpus "$CPUS" --memory "$MEMORY" \
     --cap-drop ALL \
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
     --cap-add SETUID --cap-add SETGID --cap-add KILL \
@@ -115,7 +155,8 @@ container run --rm \
     --env XDG_RUNTIME_DIR=/tmp/wayland-runtime \
     --env WAYLAND_DISPLAY=waypipe.sock \
     --env QQ_WAYLAND_SOCKET=/tmp/wayland-runtime/waypipe.sock \
-    --env QQ_ENABLE_IME="${QQ_ENABLE_IME:-0}" \
+    --env QQ_ENABLE_IME="${IME}" \
+    --env QQ_EXTRA_ARGS="${EXTRA_ARGS}" \
     --env LIBGL_ALWAYS_SOFTWARE=1 \
     --publish-socket "$host_transport:/tmp/cocoa-way/transport.sock" \
     --mount type=bind,source="$(pwd)/QQ",target=/home/user/.config/QQ \
