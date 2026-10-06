@@ -1,3 +1,5 @@
 .env
 QQ/
 shared/
+.x11-cookie
+.x11-auth/
