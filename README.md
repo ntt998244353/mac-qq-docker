@@ -367,35 +367,115 @@ Apple `container` 没有 GPU 直通，所以 `qq-wrapper.sh` 里强制软件渲�
 > 让 Chromium 自己选软件 fallback，走 `GLSurfaceEglReadbackWayland`（wl_shm readback），
 > 实测窗口可渲染、可交互（窗口约 900×700，可缩放）。两个模式都能用，只是 Wayland 对鼠标键盘事件更安全（无 X11 键盘记录风险）。
 
-### GPU 加速：两条备选路线已调研（结论：暂不可行）
+### GPU 加速：局限与两条备选路线
 
 `container` 虚拟机的内核是固定的、不可加载模块、也没有 `/dev/dri`，所以 VM 内无法直接出 GPU。
-为了给 QQ 争取 GPU 加速，调研了两种替代拓扑，都因硬性阻断而**不可行**。
 
-#### 备选 1：lima `krunkit` 虚拟机（Virtio-gpu 直通）
+注意区分两件事：
+- **QQ 现在跑在哪里**：Apple `container` VM。这个 VM **确实没有 GPU**，也**没法加**
+  （`container-apiserver` 没有任何 graphics-device 配置 API，二进制层面查过）。
+- **lima `krunkit` VM 是否有 GPU**：**有，而且默认就开**（见下）。但那是另一个 VM，把 QQ
+  搬过去是另一条路线。
 
-思路：把 QQ 挪到一个 lima `vmType: krunkit` 的 VM 里（krunkit 基于 libkrun + Apple
-Virtualization.framework），据说能带 virtio-gpu，从而在 guest 里有 `/dev/dri`。
+#### 事实澄清：lima 的 krunkit VM 确实有 GPU（默认开启）
 
-**结论：不行，krunkit 既无 GPU、也无 Rosetta。** 已按 lima v2.2.0 + krunkit 源码逐条核实：
+CNCF 博客与 lima 官方文档说的都是对的：krunkit（基于 libkrun）给 guest 提供 GPU，
+llama.cpp 在 guest 里能把 Apple 芯片识别成虚拟 GPU。已在 krunkit 源码里逐行核实：
 
-- lima 的 krunkit 驱动 `Cmdline()` 只发射 `virtio-serial / virtio-blk / virtio-vsock /
-virtio-net / virtio-fs`，**没有 `virtio-gpu`**（`pkg/driver/krunkit/krunkit_darwin_arm64.go`）。
-- 就算手动给 krunkit 传 `--device virtio-gpu,width=..,height=..`，krunkit 的 `src/virtio.rs`
-  对 `Gpu` 直接落到 `_ => Ok(())` —— 注释明言 “virtio-gpu … currently not configured in krun”，
-  **是个 no-op**。
-- 之前二进制 `strings` 里见到 `VZVirtioGraphicsDeviceConfiguration` / Rosetta 的 CDI 配置，
-  其实是 `lima-driver-krunkit` 因 import `pkg/driver/vz`（仅为 `PassFDToUnix`）而**链接进来的
-  vz 驱动惰性符号**，krunkit 虚拟机根本不会执行它们。
-- **Rosetta 只有 vz 驱动支持**（`vmOpts.vz.rosetta`），krunkit 不接。所以 x86_64 QQ 在
-  krunkit guest 里跑不了，只能跑原生 aarch64 QQ —— 而我们已确认官方有 arm64 包（见上文）。
-- 但即便用原生 arm64 QQ，krunkit 仍没有 `/dev/dri` 的 virtio-gpu，QQ 还是软件渲染，
-  **毫无 GPU 收益**，反而引入一个还是 beta、headless、没有 GUI 支持的外部驱动。
+- `src/context.rs` 里**无条件**调用：
+  ```rust
+  // Temporarily enable GPU by default
+  let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
+  krun_set_gpu_options2(id, virgl_flags, vram);
+  ```
+  即每个 krunkit VM 启动时**默认就带 GPU**，不需要 lima 传任何 `--device` 参数
+  （所以 lima 的 `Cmdline()` 里没有 GPU 相关 flag 是正常的）。
+- **但这个 GPU 是 Venus（Vulkan）专供**：`VIRGLRENDERER_NO_VIRGL` 明确**关掉了传统
+  OpenGL/virgl 路径**，只暴露 Vulkan。VRAM 按宿主内存自动分配（上限受 64 GB IPA 限制）。
 
-结论：保持现状（vz + Rosetta + Wayland）是最稳的；krunkit 要等 lima 真发射 virtio-gpu、
-并且 krunkit/libkrun 在 macOS 上真的配置 virtio-gpu 之后再考虑。
+> 早期调研误判“krunkit 没有 GPU”的原因：只看了 `src/virtio.rs` 里
+> `--device virtio-gpu,...` 这个 **CLI 字符串解析**分支（它确实落到 `_ => Ok(())`，是一个
+> 旧的 2D framebuffer/scanout 占位，未实现），而漏看了 `context.rs` 里**默认就在跑**的
+> 真正 3D GPU 初始化。两者是两回事。
 
-#### 备选 2：GPU-over-IP（remote-virtio-gpu 桥）
+#### 实测结论：krunkit 的 GPU 当前**无法使用**（上游 bug 卡死在 `vkCreateInstance`）
+
+上面是“有没有”的问题（有）。真正关键的是“能不能用”——本项目已**实际装了 krunkit 并
+在 VM 里跑通全部探测**（Apple M5 Pro / macOS 26.6.2，lima 2.2.0，krunkit 1.3.2，
+libkrun 1.19.6，libkrunfw 5.6.2，virglrenderer-krun 0.10.4e，molten-vk 1.4.2，
+guest Ubuntu 24.04.5 arm64，Mesa 25.2.8）。结果为：
+
+**确实有 `/dev/dri`：**
+```
+/dev/dri/card0       (226,0)
+/dev/dri/renderD128  (226,128)
+[drm] features: +virgl +edid +resource_blob +host_visible +context_init
+[drm] Initialized virtio_gpu 0.1.0 0
+[drm] KMS disabled        <-- 没有 scanout/显示输出能力
+```
+
+**但 Vulkan (Venus) 连 instance 都建不起来：**
+```
+$ VN_DEBUG=all vulkaninfo --summary
+MESA-VIRTIO: using DRM device /dev/dri/renderD128
+MESA-VIRTIO: connected to renderer          <-- 通到宿主了
+MESA-VIRTIO: VK_MESA_venus_protocol spec version 1
+MESA-VIRTIO: failed to allocate/map ring shmem    <-- 死在这里
+MESA-VIRTIO: vn_CreateInstance: VK_ERROR_OUT_OF_HOST_MEMORY
+ERROR: vkCreateInstance failed with ERROR_OUT_OF_HOST_MEMORY
+```
+内核侧同步报错（每次尝试）：
+```
+[drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1200 (command 0x208)
+[drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1200 (command 0x209)
+```
+
+**根因已由上游维护者确认**（`libkrun/krunkit` issue #114，2026-08 开、当月由 slp 关闭）：
+- Apple Silicon 的 **VM page size = 16384**。`resource_map_blob` 把**未对齐**的
+  `resource.size`（135168）直接传进 `hv_vm_map()`，因非 16384 对齐被拒 → guest `mmap`
+  返回 `EINVAL` → `VK_ERROR_OUT_OF_HOST_MEMORY`。
+- Venus 的 ring shmem = **131268 字节**（guest 4 KiB 页圆整成 135168 = 33×4 KiB），
+  需 144 KiB 才能让宿主映射成功。
+- 维护者原话：*“Since 7.2, the kernel provides a way for userspace to read the minimum
+  alignment requirements for the virtio-gpu driver (`VIRTIO_GPU_F_BLOB_ALIGNMENT`).
+  We need to extend Mesa to make use of it align the BOs as required. **We can't fix this
+  from neither krunkit nor libkrun.**”*
+- 唯一 workaround：用 slp 的下游补丁重编译 **guest Mesa**（4 处 hunk 都需要）：
+  <https://gitlab.freedesktop.org/slp/mesa/-/commit/761ef1ec5ff2aae1cc3dc8bbc22b3d06ef04b549>
+  （注：仅改 `vn_ring.c` 能过 `vkCreateInstance`，但接着会在设备内存分配时再失败。）
+
+#### 关于“Vulkan 可直接从 DRM 分配 GBM 并显示、不需要 GL/EGL”
+
+这个说法**本身是成立的**（`VK_EXT_image_drm_format_modifier` + `VK_KHR_display` /
+`VK_EXT_acquire_drm_display`，Venus 也确实有 no-GL 模式）。但在 krunkit 上这条路
+**当前根本走不到**：Vulkan instance 就建不起来（见上）。而且即使 Venus 修好了，
+还有两个额外障碍：
+- `[drm] KMS disabled` —— 这块 virtio-gpu **没有 scanout/显示输出**，是 render-only 设备，
+  “通过 DRM 直接显示”在 guest 内不成立（只能当离屏/headless 渲染节点）。
+- **Qt/Electron 的实际渲染路径不是 Vulkan**。QQ(NT) 是 Electron，Linux 下窗口合成走
+  GL/EGL/GBM；就算 Vulkan 可用，也得 QQ/Chromium 主动走 Vulkan 后端（`--use-vulkan`）
+  才谈得上受益。而 krunkit 用 `VIRGLRENDERER_NO_VIRGL` **把 OpenGL 路径关了**。
+
+> 补充：slp 另有一支下游 Mesa 补丁（见上）能修好 Venus。若你想继续追，最有价值的一步是在
+> guest 里用那支补丁重编 Mesa，然后 `vulkaninfo --summary` 看能否成功；能成功的话再谈
+> GBM/DRM。但即便如此，Electron 能否用上仍是另一个未验证的问题。
+
+#### 即使 GPU 修好了，QQ 还有别的障碍
+
+假设 slp 的 Mesa 补丁让 Venus 能跑（或上游修了桶），要真的给 QQ 用上还有：
+
+1. **KMS disabled**：这块 virtio-gpu 没有 scanout，是 render-only 设备，“从 DRM 直接显示”
+   在 guest 内不成立；且 krunkit 用 `VIRGLRENDERER_NO_VIRGL` **把 OpenGL 路径关了**，
+   而 Electron/Chromium 在 Linux 的窗口合成默认走 GL/EGL/GBM。要受益得让 QQ 走 Vulkan
+   后端（`--use-vulkan`）+ 自建 Wayland/compositor，是个原型级工程。
+2. **krunkit 不提供 Rosetta**（Rosetta 是 lima `vz` 驱动专有）。所以搬过去就必须用
+   **原生 aarch64 QQ**——好消息是**官方确实有 arm64 包**（同上文，`3.2.34-53644_arm64.deb`，
+   实测可下载）。
+
+> lima 的 krunkit 驱动是**外部驱动、仍为 experimental**，且 `CanRunGUI=false`。
+> 本项目已实测创建一个 `qq-gpu-test` 实例；若你要继续实验，它保留在 `~/.lima/qq-gpu-test`。
+
+#### 备选 2：GPU-over-IP（remote-virtio-gpu 桥）——客户端在 container 里不可行
 
 思路：将 GPU 渲染拆成 server/client。`rvgpu-renderer` 在一台有 GPU 的 Linux 主机上渲染，
 `rvgpu-proxy`（app 侧）通过加载 `virtio-gpu` + `virtio-lo`（自研 `virtio-loopback-driver`
@@ -410,10 +490,26 @@ virtio-net / virtio-fs`，**没有 `virtio-gpu`**（`pkg/driver/krunkit/krunkit_
   `/proc/modules`、无 `insmod/lsmod/modinfo`、无 `/dev/dri`）。没有 `virtio-lo`，
   `cardX` 节点根本造不出来，client 侧直接死掉。
 - 两个端点都必须是 Linux（server 要 mesa/virgl/GBM/EGL/Wayland + `virtio-lo` 模块，
-  **macOS 当不了 server**）。即便两端都用 Linux 虚拟机，virgl+TCP 对交互式 QQ 延迟也不理想
-  （官方建议 1 Gbps 网络），且 QQ 是否真的吃这个 DRM/virgl 节点也无人验证。
+  **macOS 当不了 server**）。且 virgl+TCP 对交互式 QQ 延迟不理想（官方建议 1 Gbps 网络），
+  QQ 是否真的吃这个 DRM/virgl 节点也无人验证。
 
-结论：只有当一个能证明 `container` VM 能加载 `virtio-lo` 时，这条才有戏——目前做不到。
+#### 小结
+
+| 路线 | 能否给 QQ 拿到 GPU | 阻断点 |
+| --- | --- | --- |
+| 现状（`container` + Wayland） | ❌ | VM 无 GPU，且无法加（无 API） |
+| lima `krunkit` | ❌（已实测） | 有 `/dev/dri`，但 **Venus 当前完全不可用**（上游 #114：ring shmem 16384 对齐 bug）；`KMS disabled`；`NO_VIRGL` 关了 GL；无 Rosetta |
+| GPU-over-IP | ❌ | `container` VM 无法加载 `virtio-lo` 内核模块 |
+
+另外补充一个对本项目**实际可用**的真相：即使 GPU 完全用不上，QQ 在 **cocoa-way** 下的渲染
+仍然正常——因为 Electron 会回退到软件 GL（`GLSurfaceEglReadbackWayland`，wl_shm readback）。
+这个“无 GPU”路径是目前已验证可用的方案，对聊天应用足够。
+
+上面这套步骤（`brew tap slp/krun && brew install krunkit`、起 krunkit VM、guest 里跑
+`vulkaninfo --summary`）本项目已经实际跑过一遍，结论就是“卡在 `vn_CreateInstance`”。
+若要继续拔，下一步只能是：**用 slp 的 Mesa 补丁在 guest 里重编 Mesa**，然后看
+`vulkaninfo --summary` 和 `vkcube` 能否成功；能成功再谈 GBM/DRM/KMS（目前 KMS 是关的）。
+在做到这一步之前，把 QQ 搬到 krunkit 不会带来任何 GPU 收益。
 
 ---
 
@@ -432,8 +528,9 @@ tldr：**你不需要为它换 arm64 包**。本项目之所以不切 arm64：
 
 1. 当前 x86_64 + Rosetta + cocoa-way Wayland 方案已经**实测可用**（cocoa-way 转发窗口可渲染、可交互）。
 2. Electron 的 x86_64→arm64 切换，QQ 登录态/缓存目录不通用，没必要为没收益的架构切换去折腾。
-3. 备选 GPU 加速方案（lima krunkit）也无法给 QQ 提供 GPU，即便用原生 arm64 版也还是软件渲染
-   （详见「### 显卡」的调研）。
+3. 备选 GPU 加速方案（lima krunkit）虽有默认开启的 GPU，但**仅 Venus/Vulkan 专供**，
+   Electron 的显示合成（GL/EGL/GBM）能否用上尚未验证，而且搬过去还得配 Wayland/compositor，
+   原型成本很高（详见「### GPU 加速」）。
 
 若未来你想用原生 arm64，把 `Dockerfile`/`run.sh` 里的 `--arch amd64 --rosetta` 换成
 `--arch arm64`，并把 apt 源/依赖换成 arm64 即可（仓库里没有内置这条路径，因为调通了毫无额外收益，

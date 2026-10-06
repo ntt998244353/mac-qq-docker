@@ -1,0 +1,71 @@
+krunkit GPU/Venus 实测结论 (2026-10-07, Apple M5 Pro, macOS 26.6.2)
+================================================================
+环境: lima 2.2.0, vmType=krunkit, krunkit 1.3.2, libkrun 1.19.6,
+      libkrunfw 5.6.2, virglrenderer-krun 0.10.4e, molten-vk 1.4.2,
+      guest Ubuntu 24.04.5 arm64, Mesa 25.2.8, libvulkan1 1.3.275
+
+1) /dev/dri 确实存在（证实博客/你）
+   /dev/dri/card0 (226,0) + /dev/dri/renderD128 (226,128)
+
+2) virtio-gpu DRM 驱动加载成功
+   [drm] features: +virgl +edid +resource_blob +host_visible +context_init
+   [drm] Initialized virtio_gpu 0.1.0 0
+   [drm] KMS disabled        <-- 无 scanout/显示输出能力
+
+3) 广告的 capset（guest dmesg）→ 对照内核 virtio_gpu.h
+   cap set 0: id 1 (VIRGL)      max-version 1, max-size 308
+   cap set 1: id 2 (VIRGL2)     max-version 2, max-size 1384
+   cap set 2: id 4 (VENUS)      max-version 0, max-size 156   <-- 退化/stub!
+   cap set 3: id 6 (DRM)        max-version 0, max-size 0
+   cap set 4: id 5 (CROSS_DOMAIN) max-version 0, max-size 16
+
+4) Vulkan/Venus 实际启动失败（决定性）
+   $ VN_DEBUG=all vulkaninfo --summary
+   MESA-VIRTIO: using DRM device /dev/dri/renderD128
+   MESA-VIRTIO: connected to renderer
+   MESA-VIRTIO: wire format version 1
+   MESA-VIRTIO: vk xml version 1.3.252
+   MESA-VIRTIO: VK_MESA_venus_protocol spec version 1
+   MESA-VIRTIO: failed to allocate/map ring shmem     <-- 失败点
+   MESA-VIRTIO: vn_CreateInstance: VK_ERROR_OUT_OF_HOST_MEMORY
+   vulkaninfo: vkCreateInstance failed with ERROR_OUT_OF_HOST_MEMORY
+
+5) 内核侧对应错误（每次尝试都报）
+   [drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1200 (command 0x208)
+   [drm:virtio_gpu_dequeue_ctrl_func] *ERROR* response 0x1200 (command 0x209)
+   (0x208/0x209 = RESOURCE_CREATE_BLOB / CONTEXT_INIT；0x1200 = ERR_UNSPEC)
+
+6) krunkit 源码侧（默认开 GPU，仅 Venus）
+   src/context.rs:173  // Temporarily enable GPU by default
+                       virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL
+                       krun_set_gpu_options2(id, virgl_flags, vram)
+   -> CLI 无 --gpu flag；GPU 默认开、无法关；NO_VIRGL 关掉 OpenGL/virgl
+
+结论: krunkit VM 确实有 /dev/dri，且暴露 Venus capset，但当前
+      libkrun 1.19.6 + Virglrenderer 0.10.4e 组合下 Venus ring shmem
+      分配失败，Vulkan(venus) 完全不可用；GL(virgl) 被 NO_VIRGL 关闭；
+      KMS disabled 无显示输出。=> guest 里没有任何可用的 GPU 渲染路径。
+
+7) 上游确认（决定性，非我推测）
+   问题: libkrun/krunkit issue #114（2026-08-08 建，2026-08-24 由维护者 slp 关闭）
+   标题: "virtio/gpu: host-visible blob mappings fail unless the size is a
+          multiple of 16384 on macOS, breaking Mesa's Venus driver in guests"
+   - Apple Silicon 的 VM page size = 16384
+   - resource_map_blob 把未对齐的 resource.size (135168) 直接传给
+     HvfVm::map_memory -> hv_vm_map()，因非 16384 对齐被拒 -> ErrUnspec
+     -> guest mmap 返回 EINVAL -> VK_ERROR_OUT_OF_HOST_MEMORY
+   - Venus ring shmem = 131268 字节（guest 4KiB 页 -> 圆整到 135168 =
+     33×4KiB），需 144KiB 才能让宿主映射成功
+   维护者结论(原文): "Since 7.2, the kernel provides a way for userspace to
+     read the minimum alignment requirements for the virtio-gpu driver
+     (VIRTIO_GPU_F_BLOB_ALIGNMENT). We need to extend Mesa to make use of it
+     align the BOs as required. We can't fix this from neither krunkit nor
+     libkrun."
+   唯一 workaround: 用 slp 下游补丁重编译 guest Mesa（4 处 hunk 都需要）:
+     https://gitlab.freedesktop.org/slp/mesa/-/commit/761ef1ec5ff2aae1cc3dc8bbc22b3d06ef04b549
+     "the vn_ring.c one alone gets past vkCreateInstance, then device memory
+      allocation fails instead."
+
+8) 因此: "Venus 有 no-GL 模式 / Vulkan 可从 DRM 分配 GBM 并直接显示" 这个
+   方向本身没错，但当前在 krunkit 上被上游 bug 卡死于 vkCreateInstance，
+   连一个 Vulkan instance 都建不起来，谈不上后续 GBM/DRM 显示。
