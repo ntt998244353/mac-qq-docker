@@ -24,7 +24,7 @@
 | 网络 | `host` / 自定义 bridge | vmnet，宿主在网关 `192.168.64.1` |
 | D-Bus | 挂载宿主的 session bus socket | **容器内起私有 bus**（更安全，见下） |
 | 音频 | 挂载宿主 PulseAudio socket | 可选，走 TCP（见「音频」） |
-| 架构 | 原生 x86_64 | amd64 镜像 + **Rosetta**（QQ 只发 x86_64） |
+| 架构 | 原生 x86_64 | amd64 镜像 + **Rosetta**（本项目用 x86_64 版；官方也有 arm64 版，见「接入方式说明：Rosetta」） |
 | 输入法 | fcitx5 + 宿主 X | fcitx5，但 IME 在容器内（见「输入法」） |
 | 打包 | AUR `makepkg` 或第三方仓库 | **腾讯官方 deb + sha512 校验** |
 
@@ -362,13 +362,82 @@ nc -z 127.0.0.1 6000 && echo 'X11 OK'
 Apple `container` 没有 GPU 直通，所以 `qq-wrapper.sh` 里强制软件渲染
 （`--disable-gpu`、`LIBGL_ALWAYS_SOFTWARE=1`）。QQ 的动画会略卡，但能正常用。
 
+> 说明：上面的旧版强制软件渲染描述主要针对 **X11** 模式。**Wayland 模式**（本项目当前默认，
+> via cocoa-way）走的是另一个更顺的路子：`qq-wrapper.sh` 在 Wayland 下**故意不加任何 GL 开关**，
+> 让 Chromium 自己选软件 fallback，走 `GLSurfaceEglReadbackWayland`（wl_shm readback），
+> 实测窗口可渲染、可交互（窗口约 900×700，可缩放）。两个模式都能用，只是 Wayland 对鼠标键盘事件更安全（无 X11 键盘记录风险）。
+
+### GPU 加速：两条备选路线已调研（结论：暂不可行）
+
+`container` 虚拟机的内核是固定的、不可加载模块、也没有 `/dev/dri`，所以 VM 内无法直接出 GPU。
+为了给 QQ 争取 GPU 加速，调研了两种替代拓扑，都因硬性阻断而**不可行**。
+
+#### 备选 1：lima `krunkit` 虚拟机（Virtio-gpu 直通）
+
+思路：把 QQ 挪到一个 lima `vmType: krunkit` 的 VM 里（krunkit 基于 libkrun + Apple
+Virtualization.framework），据说能带 virtio-gpu，从而在 guest 里有 `/dev/dri`。
+
+**结论：不行，krunkit 既无 GPU、也无 Rosetta。** 已按 lima v2.2.0 + krunkit 源码逐条核实：
+
+- lima 的 krunkit 驱动 `Cmdline()` 只发射 `virtio-serial / virtio-blk / virtio-vsock /
+virtio-net / virtio-fs`，**没有 `virtio-gpu`**（`pkg/driver/krunkit/krunkit_darwin_arm64.go`）。
+- 就算手动给 krunkit 传 `--device virtio-gpu,width=..,height=..`，krunkit 的 `src/virtio.rs`
+  对 `Gpu` 直接落到 `_ => Ok(())` —— 注释明言 “virtio-gpu … currently not configured in krun”，
+  **是个 no-op**。
+- 之前二进制 `strings` 里见到 `VZVirtioGraphicsDeviceConfiguration` / Rosetta 的 CDI 配置，
+  其实是 `lima-driver-krunkit` 因 import `pkg/driver/vz`（仅为 `PassFDToUnix`）而**链接进来的
+  vz 驱动惰性符号**，krunkit 虚拟机根本不会执行它们。
+- **Rosetta 只有 vz 驱动支持**（`vmOpts.vz.rosetta`），krunkit 不接。所以 x86_64 QQ 在
+  krunkit guest 里跑不了，只能跑原生 aarch64 QQ —— 而我们已确认官方有 arm64 包（见上文）。
+- 但即便用原生 arm64 QQ，krunkit 仍没有 `/dev/dri` 的 virtio-gpu，QQ 还是软件渲染，
+  **毫无 GPU 收益**，反而引入一个还是 beta、headless、没有 GUI 支持的外部驱动。
+
+结论：保持现状（vz + Rosetta + Wayland）是最稳的；krunkit 要等 lima 真发射 virtio-gpu、
+并且 krunkit/libkrun 在 macOS 上真的配置 virtio-gpu 之后再考虑。
+
+#### 备选 2：GPU-over-IP（remote-virtio-gpu 桥）
+
+思路：将 GPU 渲染拆成 server/client。`rvgpu-renderer` 在一台有 GPU 的 Linux 主机上渲染，
+`rvgpu-proxy`（app 侧）通过加载 `virtio-gpu` + `virtio-lo`（自研 `virtio-loopback-driver`
+内核模块）在本地**新建一个 `/dev/dri/cardX` 节点**，经由 TCP（默认 55667）把 QQ 的绘制命令
+转发到 server 端真实 GPU。
+
+**结论：客户端在 `container` VM 里无法工作。** 决定性阻断：
+
+- `rvgpu-proxy` 必须 `modprobe virtio-gpu; modprobe virtio-lo` 加载内核模块才能创建
+  `/dev/dri/cardX`。
+- 但 Apple `container` VM 的内核**固定、不可加载模块**（实测无 `/lib/modules`、无
+  `/proc/modules`、无 `insmod/lsmod/modinfo`、无 `/dev/dri`）。没有 `virtio-lo`，
+  `cardX` 节点根本造不出来，client 侧直接死掉。
+- 两个端点都必须是 Linux（server 要 mesa/virgl/GBM/EGL/Wayland + `virtio-lo` 模块，
+  **macOS 当不了 server**）。即便两端都用 Linux 虚拟机，virgl+TCP 对交互式 QQ 延迟也不理想
+  （官方建议 1 Gbps 网络），且 QQ 是否真的吃这个 DRM/virgl 节点也无人验证。
+
+结论：只有当一个能证明 `container` VM 能加载 `virtio-lo` 时，这条才有戏——目前做不到。
+
 ---
 
 ## 接入方式说明：Rosetta
 
-腾讯只发布了 x86_64 的 Linux QQ（arm64 版本在官方渠道拿不到——已确认官方 JSON API
-和镜像站都只有 `amd64`）。所以镜像按 `linux/amd64` 构建，靠 Apple 的 Rosetta
-在 VM 里做二进制翻译运行。
+> 更正：**官方确实发布了 arm64（aarch64）版 Linux QQ**，版本号和 x86_64 同步。
+> 下载例：`https://qqdl.gtimg.cn/qqfile/QQNT/9.9.36/beta/9ee04bef/linuxqq_3.2.34-53644_arm64.deb`
+> （实测可下载，包内 `Architecture: arm64`，与 x86_64 同为 `3.2.34-53644`，
+> sha512 `fa1424d4...a5d1`）。早期结论“只有 amd64”是因为 `im.qq.com` 的
+> `linuxQQDownload` API 只回 `x64DownloadUrl`，而 arm64 走的是腾讯的 QQNT CDN
+> 路径（`qqdl.gtimg.cn/qqfile/QQNT/...`），不在那个 JSON API 字段里。
+
+本项目仍按 `linux/amd64` + Rosetta 构建，顺着已有的 x86_64 流程走（稳定性优先）。
+
+tldr：**你不需要为它换 arm64 包**。本项目之所以不切 arm64：
+
+1. 当前 x86_64 + Rosetta + cocoa-way Wayland 方案已经**实测可用**（cocoa-way 转发窗口可渲染、可交互）。
+2. Electron 的 x86_64→arm64 切换，QQ 登录态/缓存目录不通用，没必要为没收益的架构切换去折腾。
+3. 备选 GPU 加速方案（lima krunkit）也无法给 QQ 提供 GPU，即便用原生 arm64 版也还是软件渲染
+   （详见「### 显卡」的调研）。
+
+若未来你想用原生 arm64，把 `Dockerfile`/`run.sh` 里的 `--arch amd64 --rosetta` 换成
+`--arch arm64`，并把 apt 源/依赖换成 arm64 即可（仓库里没有内置这条路径，因为调通了毫无额外收益，
+反而多一层风险）。
 
 `./build.sh` 和 `./run.sh` 都带了 `--rosetta`，无需额外配置。
 
