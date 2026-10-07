@@ -34,7 +34,23 @@ if [ "${BACKEND}" = "wayland" ]; then
     # waypipe creates the client socket a moment after we start, so the socket
     # is not necessarily present yet -- that is expected, not an error.
     wl_sock="${QQ_WAYLAND_SOCKET:-${WAYLAND_DISPLAY:-waypipe.sock}}"
-    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/wayland-runtime}"
+    # XDG_RUNTIME_DIR is the directory WAYLAND_DISPLAY is resolved against, so
+    # the two must agree. Cocoa-Way starts the container with
+    #
+    #   XDG_RUNTIME_DIR=/tmp/cocoa-way-runtime
+    #
+    # and never creates that directory; the session's socket really lives in
+    # /tmp/runtime-user. Keeping the inherited value (":-" only falls back
+    # when the variable is unset, which it is not) left Chromium's child
+    # processes -- most importantly the renderer, which the zygote re-spawns
+    # with this same environment -- pointing at an empty directory with no
+    # WAYLAND_DISPLAY. The renderer then never opened the display, never
+    # committed a frame, and QQ showed an empty window while every process
+    # looked healthy. Force a directory that exists.
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "${XDG_RUNTIME_DIR:-}" ]; then
+        export XDG_RUNTIME_DIR=/tmp/runtime-user
+    fi
+    mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
     export WAYLAND_DISPLAY="$wl_sock"
     unset DISPLAY
     log "WAYLAND_DISPLAY=$wl_sock (Cocoa-Way)"

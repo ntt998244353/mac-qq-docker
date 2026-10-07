@@ -1,0 +1,137 @@
+Wayland mode: why QQ shows no window
+====================================
+
+Status: root cause NOT fully confirmed. This file records what has been
+*measured*, so the next attempt does not repeat the dead ends. Everything
+below is a command output, not an inference, unless marked "(hypothesis)".
+
+Symptom
+-------
+`./qq.sh` reports success. `cocoa-wayctl --json displays` shows
+`active: [{display_slot: "rootless-qq-amd64-wayland", ...}]`, and the macOS
+window server confirms a real on-screen window:
+
+    owner=cocoa-way  bounds={X:356, Y:100, Width:800, Height:632}
+    layer=0  alpha=1  onscreen=1        (via CGWindowListCopyWindowInfo)
+
+but the window never paints. `displays.performance[].commits_per_second`
+stays 0.0 for the rootless slot, and "Show All Windows" lists no QQ window
+because the CGWindow has an empty kCGWindowName.
+
+So three layers are all healthy and none of them is the problem:
+  - transport   : cocoa-way transport v2 "opened stream 1/2"
+  - compositor  : /tmp/cwd-*/display.log says "New client connected" x2
+  - window server: a real, visible, correctly-sized CGWindow
+
+The failure is that nothing is ever *rendered into* that window.
+
+Measured facts
+--------------
+1. The window server object exists and is on-screen (see the CGWindow line
+   above), so this is not a window-management or presentation bug.
+
+2. No frame is ever committed:
+       cocoa-wayctl --json displays | ... performance
+       -> rootless-qq-amd64-wayland commits_per_second: 0.0
+   (Note: on its own this proves little -- an idle app can legitimately be 0.
+   It only means something together with (3).)
+
+3. In a healthy-looking session there are 5 QQ processes and NO renderer:
+       16 /opt/QQ/qq            (browser)
+       23 /opt/QQ/qq            (zygote)
+       24 /opt/QQ/qq            (zygote)
+       61 /opt/QQ/qq            (utility / network)
+       70 /opt/QQ/qq            (zygote)
+   i.e. browser + zygotes + network service, never a --type=renderer.
+   Caveat: `pgrep -f "type=renderer"` is unreliable here -- inside `sh -c`
+   it matches the shell that runs it. Use
+       ps -eo args | awk '/--type=renderer/ && !/awk/'
+   An earlier "renderer=2" reading was exactly this artifact.
+
+4. A renderer DOES sometimes start and then vanishes. With
+   `--enable-logging=stderr --v=1` it is possible to catch one:
+       [1041:...:VERBOSE1:extensions/renderer/dispatcher.cc:578]
+           Num tracked contexts: 2
+   and a later sampling loop showed a stable `renderer=2` for a full minute.
+   So the renderer is not categorically absent; its lifetime is inconsistent.
+
+5. The browser process is correct, the renderer is broken. Side by side:
+       browser  : XDG_RUNTIME_DIR=/tmp/runtime-user
+                  WAYLAND_DISPLAY=wayland-5i9AmO5vnV      <- both good
+       renderer : XDG_RUNTIME_DIR=/tmp/cocoa-way-runtime
+                  WAYLAND_DISPLAY  (unset)                 <- both bad
+   This asymmetry is the most interesting fact here.
+
+6. /tmp/cocoa-way-runtime does not exist; the session socket really lives in
+   /tmp/runtime-user:
+       find / -name 'wayland-*' -type s
+       -> /tmp/runtime-user/wayland-5i9AmO5vnV      (only hit)
+
+7. Origin of the bad value: init. `tini` (pid 1) has
+       XDG_RUNTIME_DIR=/tmp/cocoa-way-runtime
+   and that string is not ours -- it is hardcoded by Cocoa-Way:
+
+       container_sessions.rs:2166
+           fn default_guest_runtime_dir() -> &'static str {
+               "/tmp/cocoa-way-runtime"
+           }
+       container_sessions.rs:347
+           .arg("--env")
+           .arg(format!("XDG_RUNTIME_DIR={}", default_guest_runtime_dir()));
+           for env in environment {
+               if !env.starts_with("XDG_RUNTIME_DIR=") {   // ours filtered out
+                   cmd.arg("--env").arg(env);
+               }
+           }
+
+   So XDG_RUNTIME_DIR cannot be overridden from the session's `env = [...]`
+   array at all -- Cocoa-Way drops any entry that sets it. Confirmed
+   empirically: adding "XDG_RUNTIME_DIR=/tmp/runtime-user" to env[] changed
+   nothing; tini still reported /tmp/cocoa-way-runtime.
+
+8. Exports from qq-wrapper.sh do not reach the renderer. Setting
+   XDG_RUNTIME_DIR/WAYLAND_DISPLAY in the wrapper (either with `:-` or
+   unconditionally) leaves the renderer with the bad pair, and making
+   /tmp/cocoa-way-runtime exist does not help either, because the renderer
+   has no WAYLAND_DISPLAY to resolve inside it.
+
+Dead ends -- do not repeat
+--------------------------
+- Creating a `display-create` display and pointing waypipe at it. Cocoa-Way
+  computes attachments as
+      active_sessions.filter(s.display_slot == slot).count()
+  i.e. only its own sessions, so such a display stays attachments:0 forever
+  and never presents. `cocoa-wayctl launch` is the only way into
+  displays.active[].
+- Guarding with ${XDG_RUNTIME_DIR:-...}. `:-` substitutes only when the
+  variable is *unset*, and here it is set (to the broken value).
+- Adding XDG_RUNTIME_DIR to the session env[] (see fact 7).
+- Trusting pgrep -f "type=renderer" / commits_per_second as pass-fail.
+- Running QQ by hand inside the container to test. QQ is the session's main
+  process; killing it tears the session down ("container not found"), and
+  guessing XDG_RUNTIME_DIR/WAYLAND_DISPLAY by hand gives a misleading
+  "Failed to connect to Wayland display" crash that the real session never
+  shows.
+
+Open questions
+--------------
+A. Why does the renderer lose WAYLAND_DISPLAY while the browser keeps it?
+   (hypothesis) Chromium's zygote/--in-process-gpu re-creates child
+   environments from the init process, which only ever had the hardcoded
+   XDG_RUNTIME_DIR and no WAYLAND_DISPLAY.
+B. Does a renderer with a correct environment actually paint? Not yet shown.
+   Testing it requires a way to give the renderer the right pair without
+   killing the session.
+C. Is `--in-process-gpu` implicated? It was added to stop a different crash,
+   but it is also what makes the GPU work share the browser's process, so it
+   may be why the renderer inherits the browser's problems.
+
+Suggested next step
+-------------------
+Do not add more flags. Instead make the *guest* expose the display where
+Chromium's children already look, from a place that runs before QQ and
+survives into init's environment: set XDG_RUNTIME_DIR/WAYLAND_DISPLAY in the
+container's own entrypoint (entrypoint.sh), which Cocoa-Way's single-app
+profile bypasses -- so this needs the profile's `command` to go through the
+entrypoint rather than exec'ing qq-wrapper.sh directly. Verify by checking
+the renderer's /proc/<pid>/environ, not by looking at the window.

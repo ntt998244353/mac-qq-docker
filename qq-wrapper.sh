@@ -120,9 +120,64 @@ if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
     # "Failed to connect to the bus: /run/dbus/system_bus_socket". Qt uses the
     # session bus for its platform theme, so start one here to match the X11
     # path's environment.
+    # XDG_RUNTIME_DIR and WAYLAND_DISPLAY must both be set and must agree:
+    # XDG_RUNTIME_DIR is the directory WAYLAND_DISPLAY is resolved against.
+    #
+    # This is not merely a matter of picking the right directory, because
+    # Cocoa-Way makes the choice for us and will not be overridden. In
+    # container_sessions.rs it does
+    #
+    #     .arg("--env")
+    #     .arg(format!("XDG_RUNTIME_DIR={}", default_guest_runtime_dir()))
+    #     for env in environment {
+    #         if !env.starts_with("XDG_RUNTIME_DIR=") {   // <- filtered out
+    #             cmd.arg("--env").arg(env);
+    #         }
+    #     }
+    #
+    # so every XDG_RUNTIME_DIR we put in the session's env[] is discarded and
+    # the guest always gets the hardcoded /tmp/cocoa-way-runtime -- a directory
+    # Cocoa-Way never creates, because the session socket actually lands in
+    # /tmp/runtime-user.
+    #
+    # Meanwhile Chromium's zygote re-creates child environments from the init
+    # process, so the renderer inherited the bare XDG_RUNTIME_DIR with no
+    # WAYLAND_DISPLAY at all:
+    #
+    #   browser  : XDG_RUNTIME_DIR=/tmp/runtime-user, WAYLAND_DISPLAY=wayland-XXX  OK
+    #   renderer : XDG_RUNTIME_DIR=/tmp/cocoa-way-runtime, WAYLAND_DISPLAY unset   broken
+    #
+    # A renderer that cannot name the socket never opens the display and never
+    # commits a frame, so QQ shows an empty window while every process looks
+    # healthy -- which is exactly the "window exists but is blank" symptom.
+    #
+    # So do not fight the environment; satisfy it. Create the directory
+    # Cocoa-Way insists on and make the real socket reachable inside it under
+    # the conventional name, then export the pair. Children that inherit
+    # either spelling will find a working socket.
+    export XDG_RUNTIME_DIR=/tmp/runtime-user
+    mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    compat_runtime_dir=/tmp/cocoa-way-runtime
+    mkdir -p "$compat_runtime_dir" && chmod 700 "$compat_runtime_dir" 2>/dev/null || true
+
+    # Cocoa-Way's relay creates the real socket a moment after we start, so
+    # wait for it rather than assuming its name.
+    real_sock=""
+    for _ in $(seq 1 100); do
+        real_sock="$(find "$XDG_RUNTIME_DIR" -maxdepth 1 -name 'wayland-*' -type s 2>/dev/null | head -1)"
+        [ -n "$real_sock" ] && break
+        sleep 0.1
+    done
+    if [ -n "$real_sock" ]; then
+        export WAYLAND_DISPLAY="$(basename "$real_sock")"
+        # Reachable under the fixed name too, for anything that assumes it.
+        ln -sfn "$real_sock" "$compat_runtime_dir/wayland-1" 2>/dev/null || true
+        log "wayland: display=$WAYLAND_DISPLAY ($real_sock)"
+    else
+        log "wayland: warning: no compositor socket appeared in $XDG_RUNTIME_DIR"
+    fi
+
     if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-launch >/dev/null 2>&1; then
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-user}"
-        mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
         if eval "$(dbus-launch --sh-syntax 2>/dev/null)"; then
             log "started private session bus: ${DBUS_SESSION_BUS_ADDRESS}"
         else
