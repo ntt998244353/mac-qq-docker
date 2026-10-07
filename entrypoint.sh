@@ -46,10 +46,19 @@ if [ "${BACKEND}" = "wayland" ]; then
     # Text-input-v3 is what Cocoa-Way surfaces to the host IME.
     export QT_IM_MODULE=fcitx
     export XMODIFIERS=@im=fcitx
+    # fcitx5's GTK3 immodule is linked into this image (fcitx5-frontend-gtk3),
+    # so GTK_IM_MODULE=fcitx makes GTK load im-fcitx5.so during init. That
+    # module fails when fcitx is not running, and the failure surfaces as the
+    # opaque "Can't create a GtkStyleContext without a display connection",
+    # which kills QQ a second or two after the first frame. Only point GTK at
+    # fcitx when fcitx is actually going to be started.
     if [ "${QQ_ENABLE_IME:-0}" = "1" ]; then
         export GTK_IM_MODULE=fcitx
     else
-        export GTK_IM_MODULE="${GTK_IM_MODULE:-gtk-im-context-simple}"
+        # NOT "${GTK_IM_MODULE:-...}": the image bakes GTK_IM_MODULE=fcitx, so
+        # that default never fires and we would keep the broken value.
+        export GTK_IM_MODULE=gtk-im-context-simple
+        unset XMODIFIERS
     fi
 else
     export DISPLAY=":${DISPLAY_NUM}"
@@ -114,6 +123,11 @@ mkdir -p /home/user/shared 2>/dev/null || true
 # and presents them through Metal on the host.
 export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 export GALLIUM_DRIVER="${GALLIUM_DRIVER:-llvmpipe}"
+# The guest VM has no /dev/dri node at all, so Mesa's loader would otherwise
+# probe for a GPU that cannot exist. Pinning the loader to the software
+# rasteriser skips that probe. Chromium still logs one "drmGetDevices2() has
+# not found any devices" line, which is expected and harmless.
+export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-swrast}"
 export ELECTRON_DISABLE_SECURITY_WARNINGS="${ELECTRON_DISABLE_SECURITY_WARNINGS:-true}"
 
 # ---------------------------------------------------------------------------

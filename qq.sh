@@ -768,7 +768,7 @@ container_run() {
         need waypipe   "Install with: brew install J-x-Z/tap/waypipe-darwin"
         exec "$PROJECT_DIR/wayland-launch.sh" \
             --name "$QQ_NAME" --image "$QQ_IMAGE" --arch "$QQ_ARCH" \
-            --cpus "$QQ_CPUS" --memory "$QQ_MEMORY" \
+            --cpus "$QQ_CPUS" --memory "$QQ_MEMORY" --shm-size "$QQ_SHM_SIZE" \
             --ime "$QQ_ENABLE_IME" --extra-args "$QQ_EXTRA_ARGS"
     fi
 

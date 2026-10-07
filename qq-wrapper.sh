@@ -36,30 +36,54 @@ fi
 #       never grows past "opened stream 1/2". This is what the X11 path uses,
 #       and it is fine there (X11 has no dmabuf requirement at all).
 #
-#   (no GL switch at all)  <-- Wayland wants this
+#   (no GL switch at all)  <-- tried on Wayland; rejected, see below
 #       Chromium picks its own software fallback and
 #       ui/ozone/platform/wayland/gpu/wayland_surface_factory.cc selects the
 #       GLSurfaceEglReadbackWayland branch (render on the CPU, then present via
-#       wl_shm). That branch is what makes a window actually appear without a
-#       DRM render node. Verified working: QQ renders, accepts input, and can
-#       be logged into.
+#       wl_shm). When it works, that branch makes a window appear without a DRM
+#       render node, and QQ renders and accepts input.
+#
+#       It is however NOT reliable: Chromium still probes for a DRM node, logs
+#       "drmGetDevices2() has not found any devices" and can fail its GPU
+#       context outright ("ContextResult::kFatalFailure: WebGL1 blocklisted").
+#       When that happens the GPU process dies, which drops the Wayland
+#       connection and makes waypipe abort the session
+#       ("wl_display#1: error 3: waypipe internal error"), after which GTK
+#       reports the misleading "Can't create a GtkStyleContext without a
+#       display connection". Because the failure is a race, this path can look
+#       like it works for a while and then fail on a later launch.
+#
+#       Wayland mode therefore no longer relies on it; see the else-branch below.
 #
 #   --use-angle=swiftshader
 #       Also satisfies the same branch, but is slower and needs
 #       --enable-unsafe-swiftshader to avoid a warning. Not used; kept only as
 #       a documented alternative.
 #
-# So: only disable the GPU when we are NOT on Wayland. QQ_FORCE_SOFTWARE=1
-# forces the old behaviour on Wayland for comparison/debugging.
-if [ "${QQ_DISPLAY_BACKEND:-x11}" != "wayland" ] || [ "${QQ_FORCE_SOFTWARE:-0}" = "1" ]; then
-    ARGS+=(--disable-gpu --disable-gpu-compositing)
-    # NB: do NOT also pass --disable-software-rasterizer -- without it Chromium
-    # falls back to its own SwiftShader software path instead of failing outright.
-    ARGS+=(--in-process-gpu)
-else
-    # Deliberately no GL switch: let Chromium choose, so it takes the wl_shm
-    # readback path. See the explanation above before "improving" this.
-    log "wayland: leaving GL implementation to Chromium (wl_shm readback path)"
+# So: keep the GPU disabled on every backend. QQ_FORCE_SOFTWARE=1 is kept as an
+# explicit escape hatch; on Wayland it is now redundant (that is already the
+# default) and it remains the way to force software GL on X11.
+ARGS+=(--disable-gpu --disable-gpu-compositing)
+# NB: do NOT also pass --disable-software-rasterizer -- without it Chromium
+# falls back to its own SwiftShader software path instead of failing outright.
+ARGS+=(--in-process-gpu)
+# Make sure Chromium never depends on the tiny /dev/shm. The launcher raises it
+# with --shm-size; keep the disk-backed fallback as a belt-and-braces guarantee.
+ARGS+=(--disable-dev-shm-usage)
+
+if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
+    # Why Wayland needs this too, even though an earlier revision deliberately
+    # left GL to Chromium here: the guest VM has no /dev/dri at all, so
+    # Chromium's GPU context can fail outright ("ContextResult::kFatalFailure:
+    # WebGL1 blocklisted"). When that GPU process dies it takes the Wayland
+    # connection down with it, waypipe aborts the session
+    # ("wl_display#1: error 3: waypipe internal error") and GTK then reports the
+    # misleading "Can't create a GtkStyleContext without a display connection".
+    # Because it is a race, the no-switch path can appear to work and then fail
+    # on a later launch. --in-process-gpu keeps the GPU work from becoming a
+    # separate, killable Wayland client and --disable-gpu avoids the DRM probe.
+    # Verified stable with the display connection intact.
+    log "wayland: forcing software GL (no /dev/dri in guest)"
 fi
 
 # --- display backend -------------------------------------------------------
@@ -76,6 +100,19 @@ if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
     export ELECTRON_OZONE_PLATFORM_HINT="${ELECTRON_OZONE_PLATFORM_HINT:-wayland}"
     export GDK_BACKEND="${GDK_BACKEND:-wayland}"
     export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland}"
+
+    # The image bakes GTK_IM_MODULE=fcitx because the X11 path starts fcitx5.
+    # In Wayland mode fcitx is usually NOT running, and the fcitx GTK3 immodule
+    # is nonetheless loaded during GTK init, where it fails and takes the whole
+    # process down with the misleading message
+    #   "Gtk-ERROR: Can't create a GtkStyleContext without a display connection"
+    # about a second after the first frame is presented -- the window shows,
+    # then vanishes. Only keep the fcitx bindings when we are actually running
+    # fcitx (--ime).
+    if [ "${QQ_ENABLE_IME:-0}" != "1" ]; then
+        export GTK_IM_MODULE=gtk-im-context-simple
+        unset QT_IM_MODULE XMODIFIERS
+    fi
 
     # Same bypass means the entrypoint's private D-Bus session never starts
     # either, leaving DBUS_SESSION_BUS_ADDRESS unset. Chromium then falls back

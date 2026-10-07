@@ -30,6 +30,9 @@ ARCH="${QQ_ARCH:-amd64}"
 ROSETTA="${QQ_ROSETTA:-1}"
 CPUS="${QQ_CPUS:-4}"
 MEMORY="${QQ_MEMORY:-3G}"
+# Chromium's renderer needs far more than the 64M /dev/shm default; see the
+# comment at the `container run` invocation below.
+SHM_SIZE="${QQ_SHM_SIZE:-1G}"
 IME="${QQ_ENABLE_IME:-0}"
 EXTRA_ARGS="${QQ_EXTRA_ARGS:-}"
 
@@ -40,6 +43,7 @@ while [ $# -gt 0 ]; do
         --arch)       ARCH="$2";           shift 2 ;;
         --cpus)       CPUS="$2";           shift 2 ;;
         --memory)     MEMORY="$2";         shift 2 ;;
+        --shm-size)   SHM_SIZE="$2";       shift 2 ;;
         --ime)        IME="$2";            shift 2 ;;
         --extra-args) EXTRA_ARGS="$2";     shift 2 ;;
         --no-rosetta) ROSETTA=0;            shift   ;;
@@ -144,10 +148,20 @@ if [ "$ROSETTA" = "1" ] && [ "$ARCH" = "amd64" ]; then
 fi
 # ${arr[@]} on an empty array trips `set -u` on bash 3.2 (the macOS default),
 # so expand it only when it has an element.
+#
+# The --shm-size and the GL pinning below are not cosmetic. Chromium's renderer
+# needs shared memory, and the container default is only 64M -- small enough
+# that QQ presents a frame or two and then the renderer dies, surfacing as the
+# misleading "Gtk-ERROR: Can't create a GtkStyleContext without a display
+# connection" followed by an immediate shutdown. The guest VM also has no
+# /dev/dri at all, so Chromium would otherwise spend its startup probing for a
+# GPU that cannot exist; pinning Mesa's software rasteriser avoids that. These
+# mirror what the working Cocoa-Way container profile
+# (~/.config/cocoa-way/container-sessions.toml) sets.
 container run --rm \
     --name "$CONTAINER_NAME" \
     --arch "$ARCH" --platform "$PLATFORM" ${rosetta_flag[@]+"${rosetta_flag[@]}"} \
-    --cpus "$CPUS" --memory "$MEMORY" \
+    --cpus "$CPUS" --memory "$MEMORY" --shm-size "$SHM_SIZE" \
     --cap-drop ALL \
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
     --cap-add SETUID --cap-add SETGID --cap-add KILL \
@@ -158,6 +172,8 @@ container run --rm \
     --env QQ_ENABLE_IME="${IME}" \
     --env QQ_EXTRA_ARGS="${EXTRA_ARGS}" \
     --env LIBGL_ALWAYS_SOFTWARE=1 \
+    --env GALLIUM_DRIVER=llvmpipe \
+    --env MESA_LOADER_DRIVER_OVERRIDE=swrast \
     --publish-socket "$host_transport:/tmp/cocoa-way/transport.sock" \
     --mount type=bind,source="$(pwd)/QQ",target=/home/user/.config/QQ \
     --mount type=bind,source="$(pwd)/shared",target=/home/user/shared \
