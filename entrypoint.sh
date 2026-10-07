@@ -115,6 +115,22 @@ fi
 mkdir -p /home/user/shared 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+# 3b. Crashpad hygiene
+# ---------------------------------------------------------------------------
+# /home/user/.config/QQ is bind-mounted from the host (see .env), so crash
+# dumps accumulate across every run and are never cleaned up: a few sessions
+# are enough to reach hundreds of megabytes. Worse, Crashpad leaves *.lock
+# files in pending/ when a run is killed, and the next start then fails with
+# "open .../Crashpad/pending/<id>.lock: File exists (17)" until they are
+# removed by hand. Clear pending/ and the stale locks on every start; the
+# completed reports are left alone.
+if [ -d /home/user/.config/QQ/Crashpad ]; then
+    rm -f /home/user/.config/QQ/Crashpad/pending/*.lock 2>/dev/null || true
+    find /home/user/.config/QQ/Crashpad/pending \
+        -mindepth 1 -maxdepth 1 -mmin +1 -delete 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Rendering
 # ---------------------------------------------------------------------------
 # Apple `container` has no GPU passthrough, so Electron must use SwiftShader.
