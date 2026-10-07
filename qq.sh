@@ -54,6 +54,14 @@ QQ_MEMORY="${QQ_MEMORY:-4g}"
 QQ_SHM_SIZE="${QQ_SHM_SIZE:-2g}"
 QQ_VM_TYPE="${QQ_VM_TYPE:-vz}"            # lima only: vz | krunkit
 QQ_LIMA_OS="${QQ_LIMA_OS:-debian-12}"     # lima only: template name
+
+# Proxy handed to the guest/build. lima copies the host's HTTP(S)_PROXY into
+# the VM, which is often wrong (a proxy reachable from the host may be flaky or
+# unroutable from the guest) and shows up as apt 502s deep inside a build.
+#   (unset)  inherit whatever lima gave the VM -- historical behaviour
+#   off      explicitly unset the proxy vars in the guest
+#   <url>    force this proxy for the guest's apt/curl
+QQ_PROXY="${QQ_PROXY:-}"
 QQ_ENABLE_IME="${QQ_ENABLE_IME:-0}"
 QQ_EXTRA_ARGS="${QQ_EXTRA_ARGS:-}"
 QQ_TZ="${QQ_TZ:-${TZ:-Asia/Shanghai}}"
@@ -84,7 +92,7 @@ step() { printf '%s  -%s %s\n'    "$c_dim" "$c_reset" "$*" >&2; }
 # Does this long option take a value? Used by the argument parser.
 opt_needs_value() {
     case "$1" in
-        runtime|display|pkg|pkg-path|arch|name|image|vm-type|lima-os|\
+        runtime|display|pkg|pkg-path|arch|name|image|vm-type|lima-os|proxy|\
         cpus|memory|shm-size|extra-args|tz) return 0 ;;
         *) return 1 ;;
     esac
@@ -102,6 +110,10 @@ ${c_bold}RUNTIME${c_reset}
   -r, --runtime <container|lima>   Where QQ runs.              (default: container)
       --vm-type <vz|krunkit>       lima only: VM driver.       (default: vz)
       --lima-os <template>         lima only: guest image.     (default: debian-12)
+      --proxy <url|off>            lima only: proxy for the guest's apt/curl.
+                                   lima copies the host proxy into the VM, which
+                                   often breaks apt with 502s; pass `off` to
+                                   unset it, or a URL to override. (default: inherit)
   -n, --name <name>                Container / VM name.
 
 ${c_bold}DISPLAY${c_reset}
@@ -226,6 +238,8 @@ while [ $# -gt 0 ]; do
         image)      QQ_IMAGE="$val" ;;
         vm-type)    QQ_VM_TYPE="$val" ;;
         lima-os)    QQ_LIMA_OS="$val" ;;
+        proxy)      QQ_PROXY="$val" ;;
+        no-proxy)   QQ_PROXY="off" ;;
         cpus)       QQ_CPUS="$val" ;;
         memory)     QQ_MEMORY="$val" ;;
         shm-size)   QQ_SHM_SIZE="$val" ;;
@@ -429,7 +443,26 @@ if [ -z "$QQ_NAME" ]; then
 fi
 
 PLATFORM="linux/${QQ_ARCH}"
-[ "$QQ_ARCH" = "arm64" ] && CONTAINER_ARCH=aarch64 || CONTAINER_ARCH=amd64
+
+# The VM architecture and the container architecture are NOT the same question,
+# and lima spells neither of them the way docker does:
+#
+#   * limactl --arch takes x86_64 / aarch64 (docker says amd64 / arm64).
+#   * vz cannot run a cross-architecture guest at all -- `limactl create
+#     --arch x86_64` fails outright with "unsupported arch". So EVERY lima VM
+#     on this host is aarch64; an amd64 QQ is an amd64 *container* inside an
+#     aarch64 VM, translated by Rosetta. That is exactly how Apple `container`
+#     behaves too, which is why both runtimes share QQ_ROSETTA.
+#
+# VM_ARCH is what limactl is told; the container inside is always built for
+# $QQ_ARCH. CONTAINER_ARCH is kept for messages and the Apple `container` path,
+# which DOES accept a real cross-arch guest.
+CONTAINER_ARCH="$QQ_ARCH"
+LIMACTL_ARCH=aarch64
+if [ "$QQ_VM_TYPE" = "krunkit" ] && [ "$QQ_ARCH" != "arm64" ]; then
+    # Unreachable (validated earlier), but never hand krunkit an amd64 wish.
+    die "internal: krunkit cannot host $QQ_ARCH"
+fi
 
 # ---------------------------------------------------------------------------
 # plan output
@@ -479,25 +512,27 @@ build_image() {
 
     info "building $QQ_IMAGE for $PLATFORM"
 
+    # Exactly one source argument is passed, so the Dockerfile never has to
+    # guess (and can never silently fall back to the distro package).
+    build_args+=(--build-arg "LINUXQQ_SOURCE=$QQ_PKG")
     case "$QQ_PKG" in
         url)
             build_args+=(--build-arg "LINUXQQ_URL=$qq_url")
             build_args+=(--build-arg "LINUXQQ_SHA512=$qq_sha")
             ;;
         local)
-            # Docker's COPY fails when a glob matches nothing, so a placeholder
-            # is always staged; the real .deb replaces it.
-            stage_deb=".qq-local-package.deb"
+            stage_deb="qq-local-package.deb"
             cp -f "$QQ_PKG_PATH" "$PROJECT_DIR/$stage_deb"
-            build_args+=(--build-arg "LINUXQQ_LOCAL=$stage_deb")
             ;;
         apt)
-            build_args+=(--build-arg "LINUXQQ_FROM_APT=1")
+            : # nothing extra; LINUXQQ_SOURCE=apt is the whole instruction
             ;;
     esac
 
-    # Always satisfy the COPY glob, even for url/apt where it is unused.
-    [ -f "$PROJECT_DIR/.qq-local-package.deb" ] || : > "$PROJECT_DIR/.qq-local-package.deb"
+    # Docker's COPY fails when a glob matches nothing, so a zero-byte
+    # placeholder is always staged. The Dockerfile filters out empty files, so
+    # this can never be mistaken for a real package.
+    [ -f "$PROJECT_DIR/qq-local-package.deb" ] || : > "$PROJECT_DIR/qq-local-package.deb"
 
     local rc=0
     case "$QQ_RUNTIME" in
@@ -515,7 +550,7 @@ build_image() {
             ;;
     esac
     [ -n "$stage_deb" ] && rm -f "$PROJECT_DIR/$stage_deb"
-    rm -f "$PROJECT_DIR/.qq-local-package.deb"
+    rm -f "$PROJECT_DIR/qq-local-package.deb"
     return $rc
 }
 
@@ -529,6 +564,58 @@ build_image() {
 # engine).
 lima_instance() { printf '%s' "$QQ_NAME"; }
 
+# Emit a shell fragment (to be eval'd inside the guest) that applies the proxy
+# policy. Everything runs through it so the build and the engine install agree.
+lima_proxy_prelude() {
+    case "$QQ_PROXY" in
+        "")   # inherit: leave whatever lima injected alone
+             printf '%s' ':' ;;
+        off) printf '%s' 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy; \
+                          printf "Acquire::http::Proxy \\\"\\\";\\nAcquire::https::Proxy \\\"\\\";\\n" > /etc/apt/apt.conf.d/99qq-proxy 2>/dev/null || true' ;;
+        *)   printf '%s' "export http_proxy='$QQ_PROXY' https_proxy='$QQ_PROXY' HTTP_PROXY='$QQ_PROXY' HTTPS_PROXY='$QQ_PROXY'" ;;
+    esac
+}
+
+# debian-12 ships neither podman nor docker, and a fresh template has no engine.
+# Both are in the guest's own repos. podman is preferred (rootless, no daemon),
+# and it is also what `nerdctl`-free templates usually document.
+#
+# Must run as root inside the guest: limactl shell is passwordless sudo-capable
+# but apt itself needs root.
+lima_ensure_engine() {
+    local inst="$1"
+    if limactl shell "$inst" -- bash -lc 'command -v podman || command -v docker' \
+         >/dev/null 2>&1; then
+        return 0
+    fi
+    info "installing a container engine inside lima VM '$inst' (podman)"
+    limactl shell "$inst" -- sudo bash -lc '
+            set -eux
+            export DEBIAN_FRONTEND=noninteractive
+            '"$(lima_proxy_prelude)"'
+            apt-get update
+            apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs
+        ' </dev/null || die "could not install podman inside lima VM '$inst'"
+    limactl shell "$inst" -- bash -lc 'command -v podman' >/dev/null 2>&1 \
+        || die "podman is still missing inside lima VM '$inst'"
+}
+
+# limactl wants --memory as a bare number of GiB ("--memory float32  Memory in
+# GiB"), not the docker-style "4g" that --memory uses everywhere else, and
+# --cpus as a plain integer. Normalise here so one user-facing value works for
+# both runtimes.
+lima_memory_gib() {
+    local m="$1"
+    case "$m" in
+        *[Gg][Ii][Bb]) printf '%s' "${m%???}" ;;
+        *[Gg][Bb])     printf '%s' "${m%??}"  ;;
+        *[Gg])         printf '%s' "${m%?}"   ;;
+        *[Mm])         # sub-GiB: express as a decimal fraction of a GiB
+                       printf '%s' "$(awk -v v="${m%?}" 'BEGIN{printf "%.3f", v/1024}')" ;;
+        *)             printf '%s' "$m" ;;
+    esac
+}
+
 lima_ensure_vm() {
     need limactl "Install with: brew install lima"
     local inst; inst="$(lima_instance)"
@@ -538,52 +625,88 @@ lima_ensure_vm() {
         status="$(limactl list --format '{{.Status}}' "$inst" 2>/dev/null || echo Unknown)"
         if [ "$status" != "Running" ]; then
             info "starting lima VM '$inst'"
-            limactl start "$inst" </dev/null
+            limactl start "$inst" </dev/null \
+                || die "failed to start lima VM '$inst' (see: limactl info '$inst')"
         else
             step "lima VM '$inst' already running"
         fi
         return 0
     fi
 
-    info "creating lima VM '$inst' ($QQ_VM_TYPE, $CONTAINER_ARCH, $QQ_LIMA_OS)"
+    local mem_gib; mem_gib="$(lima_memory_gib "$QQ_MEMORY")"
+    info "creating lima VM '$inst' ($QQ_VM_TYPE, $LIMACTL_ARCH, $QQ_LIMA_OS, ${QQ_CPUS} cpu, ${mem_gib}GiB)"
     local tmpl_args=(
-        --name "$inst"
-        --vm-type "$QQ_VM_TYPE"
-        --arch "$CONTAINER_ARCH"
-        --cpus "$QQ_CPUS"
-        --memory "$QQ_MEMORY"
+        --name="$inst"
+        --vm-type="$QQ_VM_TYPE"
+        --arch="$LIMACTL_ARCH"
+        --cpus="$QQ_CPUS"
+        --memory="$mem_gib"
         --tty=false
     )
-    # Rosetta on lima is a flag of `limactl start`; only pass it when the
-    # guest really needs translation.
+    # Rosetta is a property of the VM (vz only), not of the workload: the VM is
+    # aarch64 and Rosetta is what lets an amd64 container run inside it. An
+    # arm64 container needs no translation, so it is not requested.
     [ "$QQ_ROSETTA" = "1" ] && tmpl_args+=(--rosetta)
 
-    limactl start "${tmpl_args[@]}" "$QQ_LIMA_OS" </dev/null
+    # The template MUST carry the `template:` prefix. Without it the word is
+    # read as an instance name, limactl rejects `--name` + instance name, and
+    # the flags above are silently dropped -- producing a default aarch64 VM
+    # that looks like `--arch`/`--memory` were ignored.
+    local tmpl="$QQ_LIMA_OS"
+    case "$tmpl" in
+        *:*) : ;;                 # already qualified (template:foo, ./file.yaml)
+        *.yaml|*.yml|/*) : ;;     # a path
+        *) tmpl="template:$tmpl" ;;
+    esac
+
+    # A failed create must stop the whole run: without this the very next step
+    # reports the confusing "instance `...` does not exist" instead of the
+    # real cause.
+    limactl start "${tmpl_args[@]}" "$tmpl" </dev/null \
+        || die "failed to create lima VM '$inst' (try: limactl start --vm-type=$QQ_VM_TYPE --arch=$LIMACTL_ARCH $tmpl)"
 }
 
 lima_build() {
     local stage_deb="$1"
     lima_ensure_vm
     local inst; inst="$(lima_instance)"
+    lima_ensure_engine "$inst"
 
     info "building $QQ_IMAGE inside lima VM '$inst'"
     # Ship the context in and build there. tar over ssh is the portable option
     # (the 9p/virtiofs mount of the project dir may be read-only).
-    tar -cf - --exclude .git --exclude QQ --exclude shared \
+    #
+    # COPYFILE_DISABLE=1 stops bsdtar from writing AppleDouble `._name`
+    # sidecars; the Dockerfile also filters them, but not creating them keeps
+    # the 200 MB .deb from being accompanied by junk.
+    COPYFILE_DISABLE=1 tar --no-mac-metadata -cf - \
+        --exclude .git --exclude QQ --exclude shared \
         $stage_deb Dockerfile entrypoint.sh qq-wrapper.sh 2>/dev/null \
       | limactl shell "$inst" -- bash -lc '
             set -euo pipefail
+            '"$(lima_proxy_prelude)"'
             rm -rf /tmp/qq-build && mkdir -p /tmp/qq-build && cd /tmp/qq-build
             tar -xf -
             engine=podman; command -v $engine >/dev/null 2>&1 || engine=docker
-            $engine build --arch '"$QQ_ARCH"' --build-arg USER_ID='"$(id -u)"' \
-                --build-arg GROUP_ID='"$(id -g)"' -t '"$QQ_IMAGE"' -f Dockerfile .
-        '
+            # The VM already has the wanted architecture (lima refuses to make
+            # a cross-arch VM), so the inner image is built for the guest arch
+            # and never needs Rosetta.
+            arch="$(uname -m | sed -e s/x86_64/amd64/ -e s/aarch64/arm64/)"
+            $engine build --arch "$arch" \
+                --build-arg USER_ID='"$(id -u)"' \
+                --build-arg GROUP_ID='"$(id -g)"' \
+                --build-arg LINUXQQ_SOURCE='"$QQ_PKG"' \
+                --build-arg LINUXQQ_URL='"$qq_url"' \
+                --build-arg LINUXQQ_SHA512='"$qq_sha"' \
+                -t '"$QQ_IMAGE"' -f Dockerfile .
+        ' \
+        || die "build failed inside lima VM '$inst'"
 }
 
 lima_run() {
     lima_ensure_vm
     local inst; inst="$(lima_instance)"
+    lima_ensure_engine "$inst"
 
     # The VM's ssh port is forwarded to the host, so X11 can simply point at
     # 127.0.0.1 on the guest and the host-side XQuartz sees a normal client.

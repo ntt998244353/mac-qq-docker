@@ -57,48 +57,76 @@ RUN sed -i 's/^# *\(zh_CN.UTF-8\)/\1/' /etc/locale.gen 2>/dev/null || true; \
     && locale-gen && rm -rf /var/lib/apt/lists/*
 
 # --- install linuxqq -------------------------------------------------------
-# Three sources, chosen by qq.sh --pkg:
+# Which package gets installed is decided by ./qq.sh --pkg:
 #
 #   url   (default) Tencent's official package, pinned by sha512. The amd64
 #                   artifact is the one the AUR PKGBUILD mirrors; the arm64 one
 #                   is served from the QQNT CDN. Both were verified to exist.
-#   local           a .deb the caller already has. qq.sh stages it as
-#                   .qq-local-package.deb in the build context.
+#   local           a .deb the caller already has, staged by qq.sh.
 #   apt             whatever the distro repo carries (linuxqq). Not Tencent's
 #                   official build, and not version-pinned, but requires no
 #                   download from a third-party mirror.
+#
+# The three sources are mutually exclusive. They are selected with ONE
+# argument, LINUXQQ_SOURCE, rather than by testing which arguments happen to be
+# non-empty: a stray placeholder file or an empty string must never be able to
+# silently divert the build to a different source (that is how a local-package
+# build ended up installing the distro's linuxqq instead).
+ARG LINUXQQ_SOURCE=url
 ARG LINUXQQ_URL=https://mirrors.sdu.edu.cn/spark-store-repository/store/chat/linuxqq/linuxqq_3.2.34-53644_amd64.deb
 ARG LINUXQQ_SHA512=774e45cd7238dc51b31c02ee494f9f86e773c487a90851790a806f776e130af125110045844e90dd68d0b073dc53bdd4d1c6d8fb7225b8f214fc0e35d1a20e32
 ARG LINUXQQ_LOCAL=
-ARG LINUXQQ_FROM_APT=0
 
-# Stage the local package (if any). Docker's COPY fails outright when a glob
-# matches nothing, so qq.sh always writes a placeholder file first; the real
-# package just overwrites it. The directory other-than-that stays empty for
-# the url/apt modes and the branches below ignore it.
-COPY .qq-local-package.deb* /tmp/local-qq/
+# Stage the local package, if any. Three traps, all of which produced silent
+# wrong behaviour at some point:
+#
+#   * The name must NOT start with a dot. POSIX glob `*` never matches a leading
+#     dot, so `for f in /tmp/staging/*` and `ls /tmp/staging/*` skip hidden
+#     files entirely. A dot-prefixed package made this COPY appear to work while
+#     the install loop saw an empty directory.
+#   * Docker's COPY fails outright when a glob matches nothing, so qq.sh always
+#     writes a placeholder; a zero-byte placeholder must not be treated as a
+#     package (that is how apt was once asked to "install" a bogus name and
+#     silently pulled the distro's linuxqq instead).
+#   * bsdtar (macOS tar, which qq.sh uses to ship the context into a lima VM)
+#     adds AppleDouble `._name` sidecars. They are non-empty, so a size test
+#     alone would let one through and put a junk file next to the real .deb.
+#
+# The loop filters by name AND size AND always ends with `true` so that a
+# skipped entry cannot abort the build under `set -e`.
+COPY qq-local-package.deb* /tmp/local-qq-staging/
 RUN set -eux; \
-    if [ "$LINUXQQ_FROM_APT" = "1" ]; then \
+    mkdir -p /tmp/local-qq; \
+    for f in /tmp/local-qq-staging/*; do \
+        case "${f##*/}" in ._*) continue ;; esac; \
+        if [ -f "$f" ] && [ -s "$f" ]; then mv "$f" /tmp/local-qq/; fi; \
+    done; \
+    rm -rf /tmp/local-qq-staging; \
+    true
+
+RUN set -eux; \
+    case "$LINUXQQ_SOURCE" in \
+      apt) \
         echo 'installing linuxqq from the distro repository'; \
         apt-get update; \
-        apt-get install -y --no-install-recommends linuxqq; \
-    elif [ -n "$LINUXQQ_LOCAL" ] && [ -f "/tmp/local-qq/$LINUXQQ_LOCAL" ]; then \
-        echo "installing local package $LINUXQQ_LOCAL"; \
+        apt-get install -y --no-install-recommends linuxqq ;; \
+      local) \
+        # Take the staged file by glob. The name is non-hidden on purpose; see
+        # the staging comment above. Exactly one non-empty file is expected.
+        deb="$(ls /tmp/local-qq/* 2>/dev/null | head -1)"; \
+        [ -n "$deb" ] || { echo 'no local package was staged' >&2; exit 1; }; \
+        echo "installing local package $deb"; \
         apt-get update; \
-        apt-get install -y --no-install-recommends "/tmp/local-qq/$LINUXQQ_LOCAL"; \
-    elif [ "$LINUXQQ_LOCAL" = "ondisk" ] && ls /tmp/local-qq/*.deb >/dev/null 2>&1; then \
-        # Fallback: a .deb was staged but the name was not propagated.
-        deb="$(ls /tmp/local-qq/*.deb | head -1)"; \
-        echo "installing staged package $deb"; \
-        apt-get update; \
-        apt-get install -y --no-install-recommends "$deb"; \
-    else \
+        apt-get install -y --no-install-recommends "$deb" ;; \
+      url) \
         echo "downloading $LINUXQQ_URL"; \
         curl -fL --retry 5 --retry-delay 3 -o /tmp/linuxqq.deb "$LINUXQQ_URL"; \
         echo "${LINUXQQ_SHA512}  /tmp/linuxqq.deb" | sha512sum -c -; \
         apt-get update; \
-        apt-get install -y --no-install-recommends /tmp/linuxqq.deb; \
-    fi; \
+        apt-get install -y --no-install-recommends /tmp/linuxqq.deb ;; \
+      *) \
+        echo "unknown LINUXQQ_SOURCE: $LINUXQQ_SOURCE" >&2; exit 1 ;; \
+    esac; \
     rm -f /tmp/linuxqq.deb; rm -rf /tmp/local-qq /var/lib/apt/lists/*; \
     # sanity: the Electron binary must be present and executable
     test -x /opt/QQ/qq; \
@@ -111,11 +139,22 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 ARG USER_ID=501
 ARG GROUP_ID=20
+# The GID may already be taken: Debian ships GID 20 as `dialout`, which is the
+# host's GID on macOS, so `groupadd -g 20 user` fails. Silently ignoring that
+# (the old `|| true`) left the account in group `dialout` and made every later
+# `--chown=user:user` fail with 'unknown group user'. Instead: create the group
+# only when the GID is free, otherwise name the existing group's GID explicitly
+# and use numeric ownership from then on.
 RUN set -eux; \
-    groupadd -g "${GROUP_ID}" user 2>/dev/null || true; \
-    useradd -m -u "${USER_ID}" -g "${GROUP_ID}" -s /bin/bash user; \
-    mkdir -p /home/user/.config/QQ /home/user/shared /home/user/.Xauthority.d; \
-    chown -R "${USER_ID}:${GROUP_ID}" /home/user
+    if ! getent group "${GROUP_ID}" >/dev/null 2>&1; then \
+        groupadd -g "${GROUP_ID}" user; \
+    fi; \
+    useradd -m -u "${USER_ID}" -g "${GROUP_ID}" -s /bin/bash user \
+        || usermod -g "${GROUP_ID}" user; \
+    mkdir -p /home/user/.config/QQ /home/user/shared /home/user/.Xauthority.d \
+              /home/user/.local/share; \
+    chown -R "${USER_ID}:${GROUP_ID}" /home/user; \
+    id user
 
 # QQ's Electron sandbox needs either unprivileged userns or a root-owned
 # setuid helper. Apple `container` runs containers with a restricted seccomp
@@ -123,8 +162,11 @@ RUN set -eux; \
 # --no-sandbox in the entrypoint if it cannot be used.
 RUN chown root:root /opt/QQ/chrome-sandbox && chmod 4755 /opt/QQ/chrome-sandbox
 
-COPY --chown=user:user entrypoint.sh /home/user/entrypoint.sh
-COPY --chown=user:user qq-wrapper.sh /home/user/qq-wrapper.sh
+# Numeric ownership, not `user:user`: the group name may legitimately not be
+# `user` (see the GID note above), while the numeric IDs are what the bind
+# mounts actually care about.
+COPY --chown=${USER_ID}:${GROUP_ID} entrypoint.sh /home/user/entrypoint.sh
+COPY --chown=${USER_ID}:${GROUP_ID} qq-wrapper.sh /home/user/qq-wrapper.sh
 RUN chmod +x /home/user/entrypoint.sh /home/user/qq-wrapper.sh
 
 USER user
