@@ -551,6 +551,30 @@ build_image() {
     esac
     [ -n "$stage_deb" ] && rm -f "$PROJECT_DIR/$stage_deb"
     rm -f "$PROJECT_DIR/qq-local-package.deb"
+
+    # Keep mac-qq-docker:latest in step with the image we just built.
+    #
+    # :latest is not built here -- it is the tag produced by the older
+    # ./build.sh, and it is what ~/.config/cocoa-way/container-sessions.toml
+    # names as the session image, so `cocoa-wayctl launch QQ` runs it. That
+    # made it possible for the Cocoa-Way path to keep working while qq.sh was
+    # fixed, and then to silently run months-old code after the fact.
+    #
+    # It stays amd64-only, because that session passes --arch amd64
+    # --platform linux/amd64: re-pointing the tag at an arm64 build would
+    # make Cocoa-Way fail with "platform linux/arm64". So only retag when the
+    # build we just did is the amd64 one, and never move an existing amd64
+    # tag onto a different architecture.
+    if [ $rc -eq 0 ] && [ "$QQ_RUNTIME" = "container" ]; then
+        if [ "$QQ_ARCH" = "amd64" ]; then
+            container image tag "$QQ_IMAGE" mac-qq-docker:latest >/dev/null 2>&1 \
+                && info "tagged mac-qq-docker:latest -> $QQ_IMAGE" \
+                || warn "could not re-tag mac-qq-docker:latest (cocoa-way sessions may run a stale image)"
+        else
+            info "not re-tagging mac-qq-docker:latest: it is pinned to amd64 for the Cocoa-Way session"
+        fi
+    fi
+
     return $rc
 }
 
