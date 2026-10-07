@@ -112,7 +112,7 @@ ${c_bold}RUNTIME${c_reset}
       --lima-os <template>         lima only: guest image.     (default: debian-12)
       --proxy <url|off>            lima only: proxy for the guest's apt/curl.
                                    lima copies the host proxy into the VM, which
-                                   often breaks apt with 502s; pass `off` to
+                                   often breaks apt with 502s; pass 'off' to
                                    unset it, or a URL to override. (default: inherit)
   -n, --name <name>                Container / VM name.
 
