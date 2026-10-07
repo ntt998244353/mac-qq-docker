@@ -7,9 +7,21 @@
 # the session is still running.
 set -uo pipefail
 
-# Matches the default Cocoa-Way derives; override with QQ_SESSION_NAME or
-# CONTAINER_NAME the same way wayland-launch.sh does.
-NAME="${QQ_SESSION_NAME:-${CONTAINER_NAME:-qq-wayland}}"
+# Matches the name wayland-launch.sh ends up using, which is not always the
+# default: qq.sh passes --name based on the architecture it selected (e.g.
+# qq-amd64-wayland), so assuming "qq-wayland" here silently failed to stop the
+# real session -- it reported "no Cocoa-Way session named qq-wayland" while the
+# container kept running, and a following launch then reused that stale
+# container. Derive it the same way instead of guessing.
+NAME="${QQ_SESSION_NAME:-${CONTAINER_NAME:-}}"
+if [ -z "$NAME" ]; then
+    # Adopt the running session when there is exactly one, otherwise fall back
+    # to the plain default.
+    NAME="$(cocoa-wayctl --json sessions 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' \
+        | grep -v '^QQ$' | head -1 || true)"
+    [ -n "$NAME" ] || NAME=qq-wayland
+fi
 
 stopped=0
 if command -v cocoa-wayctl >/dev/null 2>&1; then

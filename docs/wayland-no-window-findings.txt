@@ -135,3 +135,78 @@ container's own entrypoint (entrypoint.sh), which Cocoa-Way's single-app
 profile bypasses -- so this needs the profile's `command` to go through the
 entrypoint rather than exec'ing qq-wrapper.sh directly. Verify by checking
 the renderer's /proc/<pid>/environ, not by looking at the window.
+
+==========================================================================
+CORRECTION (added after the flag fix landed)
+==========================================================================
+
+The conclusions above about the renderer were WRONG, and the mistake is worth
+recording because it sent the investigation down a blind alley.
+
+What is actually true:
+
+* QQ on this build renders IN-PROCESS. A healthy, fully interactive session
+  has zero --type=renderer and zero --type=gpu-process children:
+
+      --type=utility   x2   (network, audio)
+      --type=zygote    x7
+      (nothing else)
+
+  while the browser process (pid 16) carries ~87 threads and holds the two
+  Wayland socket fds. Counting renderers therefore measures nothing at all;
+  "0 renderers" is the NORMAL state of a working window, not a symptom.
+
+* The real ground truth is frame commits. Sample a few times:
+
+      for i in 1 2 3 4; do
+        cocoa-wayctl --json displays | <read performance[].commits_per_second>
+        sleep 4
+      done
+
+  A working, interactive QQ window gives 0 when idle and ~20-36 when it
+  repaints. A single reading of 0.0 means nothing.
+
+* The genuine defect was the GL flag set, not a missing renderer. The Wayland
+  path was inheriting the X11 flags:
+
+      --disable-gpu --disable-gpu-compositing --in-process-gpu
+
+  With --disable-gpu, Chromium lands in GpuMode::SOFTWARE_GL with the GL
+  implementation effectively disabled, and NO FRAME IS EVER COMMITTED -- the
+  compositor holds an empty 800x632 window forever. That is the real
+  "window exists but is blank" mechanism, and it is precisely what the long
+  comment in qq-wrapper.sh had been warning about while the code went on
+  doing it anyway.
+
+  Fix: on Wayland, strip those three flags and let Chromium take its own
+  software fallback. wayland_surface_factory.cc then selects the
+  GLSurfaceEglReadbackWayland branch, which renders on the CPU and presents
+  via wl_shm -- requiring neither a DRM render node nor dmabuf, which is
+  exactly right for a guest with no /dev/dri. See qq-wrapper.sh, the
+  `if [ "$QQ_DISPLAY_BACKEND" = wayland ]` branch.
+
+* Two further traps that produced false readings during this investigation:
+
+  - A long-lived cocoa-way daemon can keep ORPHAN 800x632 windows from
+    earlier sessions. `CGWindowListCopyWindowInfo` reports one of them as
+    onscreen=1, so "a window is onscreen" was true while the QQ session's own
+    window (different pid, same coordinates) stayed at onscreen=?. Always
+    match the window to the session's display_pid, and when in doubt stop the
+    session and confirm the window disappears.
+
+  - `cocoa-wayctl --json displays` active[] lists the DISPLAY subprocess
+    (display_pid), not a client window, so a non-empty active[] never proved
+    QQ had drawn anything.
+
+* Finally, QQ's NativeCrashHandler is NOT evidence of a crash. It runs on
+  every startup, and with no crash record present it still builds a small
+  (~27 KB) event payload from empty paths and uploads it, then reports
+  `response code: 200`:
+
+      parseCrashDetailBean backupRecordPath:.../crash_files/backup_record.txt
+      parseCrashDetailBean sysLogPath:
+      parseCrashDetailBean sysLog:
+
+  With backup_record.txt absent and crash_files/ empty, that upload is a
+  no-op check-in. Confirm a real crash by looking for a fresh .dmp under
+  QQ/Crashpad/ instead.

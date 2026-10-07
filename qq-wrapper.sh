@@ -63,6 +63,14 @@ fi
 # So: keep the GPU disabled on every backend. QQ_FORCE_SOFTWARE=1 is kept as an
 # explicit escape hatch; on Wayland it is now redundant (that is already the
 # default) and it remains the way to force software GL on X11.
+# The default for X11, and also the fallback for Wayland (see the branch
+# below, which overrides this). On X11 there is no dmabuf requirement, so a
+# disabled GPU is harmless and these are the right flags.
+#
+# On Wayland they are NOT: as the notes above say, --disable-gpu leaves the
+# renderer unable to commit a frame at all -- the compositor holds an empty
+# window and waypipe never grows past "opened stream 1/2". The Wayland branch
+# below therefore replaces them.
 ARGS+=(--disable-gpu --disable-gpu-compositing)
 # NB: do NOT also pass --disable-software-rasterizer -- without it Chromium
 # falls back to its own SwiftShader software path instead of failing outright.
@@ -72,18 +80,31 @@ ARGS+=(--in-process-gpu)
 ARGS+=(--disable-dev-shm-usage)
 
 if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
-    # Why Wayland needs this too, even though an earlier revision deliberately
-    # left GL to Chromium here: the guest VM has no /dev/dri at all, so
-    # Chromium's GPU context can fail outright ("ContextResult::kFatalFailure:
-    # WebGL1 blocklisted"). When that GPU process dies it takes the Wayland
-    # connection down with it, waypipe aborts the session
-    # ("wl_display#1: error 3: waypipe internal error") and GTK then reports the
-    # misleading "Can't create a GtkStyleContext without a display connection".
-    # Because it is a race, the no-switch path can appear to work and then fail
-    # on a later launch. --in-process-gpu keeps the GPU work from becoming a
-    # separate, killable Wayland client and --disable-gpu avoids the DRM probe.
-    # Verified stable with the display connection intact.
-    log "wayland: forcing software GL (no /dev/dri in guest)"
+    # Wayland must NOT reuse the X11 flag set above. --disable-gpu drops
+    # Chromium into GpuMode::SOFTWARE_GL with the GL implementation effectively
+    # disabled, and the renderer then never commits anything: the compositor
+    # keeps an empty 800x632 window, `commits_per_second` stays 0.0 and no
+    # renderer process is ever forked. That is the "window exists but is blank"
+    # symptom, and it is why the notes above say Wayland must not rely on
+    # --disable-gpu -- even though the unconditional lines above did exactly
+    # that.
+    #
+    # What does work is letting Chromium take its own software fallback path.
+    # Without a GL switch, wayland_surface_factory.cc picks the
+    # GLSurfaceEglReadbackWayland branch: it renders on the CPU and presents
+    # through wl_shm, which needs no DRM render node and no dmabuf -- exactly
+    # right for a guest with no /dev/dri.
+    #
+    # Strip the X11 GPU flags and leave the choice to Chromium.
+    _kept=()
+    for _a in "${ARGS[@]}"; do
+        case "$_a" in
+            --disable-gpu|--disable-gpu-compositing|--in-process-gpu) ;;
+            *) _kept+=("$_a") ;;
+        esac
+    done
+    ARGS=("${_kept[@]}")
+    log "wayland: leaving GL to Chromium's wl_shm software path (no /dev/dri in guest)"
 fi
 
 # --- display backend -------------------------------------------------------
@@ -170,8 +191,13 @@ if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
     done
     if [ -n "$real_sock" ]; then
         export WAYLAND_DISPLAY="$(basename "$real_sock")"
-        # Reachable under the fixed name too, for anything that assumes it.
+        # Reachable under the names a child may assume. A renderer that
+        # inherits no WAYLAND_DISPLAY calls wl_display_connect(NULL), and
+        # libwayland then tries "wayland-0" -- so that alias matters more than
+        # wayland-1 here.
+        ln -sfn "$real_sock" "$compat_runtime_dir/wayland-0" 2>/dev/null || true
         ln -sfn "$real_sock" "$compat_runtime_dir/wayland-1" 2>/dev/null || true
+        ln -sfn "$real_sock" "$XDG_RUNTIME_DIR/wayland-0" 2>/dev/null || true
         log "wayland: display=$WAYLAND_DISPLAY ($real_sock)"
     else
         log "wayland: warning: no compositor socket appeared in $XDG_RUNTIME_DIR"

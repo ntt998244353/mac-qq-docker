@@ -39,7 +39,9 @@ set -euo pipefail
 
 VER="2.0.3"
 SRC_REPO="https://github.com/J-x-Z/cocoa-way"
-BRANCH="master"
+# Upstream's default branch is "main"; there is no "master", so cloning with
+# -b master fails with "couldn't find remote ref master".
+BRANCH="main"
 CELLAR_BIN="/usr/local/Cellar/cocoa-way/$VER/bin/cocoa-way"
 HOMEBREW_PREFIX="$(brew --prefix)"
 CELLAR_BIN="$HOMEBREW_PREFIX/Cellar/cocoa-way/$VER/bin/cocoa-way"
