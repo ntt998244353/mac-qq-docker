@@ -67,6 +67,8 @@ QQ_EXTRA_ARGS="${QQ_EXTRA_ARGS:-}"
 QQ_TZ="${QQ_TZ:-${TZ:-Asia/Shanghai}}"
 QQ_BUILD=0
 QQ_DRY_RUN=0
+QQ_UNINSTALL=0
+QQ_PURGE=0
 
 # Tencent's official Linux packages. The amd64 one is the same artifact the
 # AUR PKGBUILD mirrors; the arm64 one is served from the QQNT CDN. Both were
@@ -146,8 +148,23 @@ ${c_bold}RESOURCES${c_reset}
 
 ${c_bold}ACTIONS${c_reset}
       --build                      (Re)build the image / prepare the VM first.
+      --uninstall                  Remove everything this project installed:
+                                   the Cocoa-Way session, the container(s), the
+                                   image(s), and the generated session block.
+                                   User data (QQ/ and shared/) is KEPT unless
+                                   --purge is also given.
+      --purge                      With --uninstall, also delete ./QQ and
+                                   ./shared (chat history and login state).
       --dry-run                    Print the resolved plan and exit.
   -h, --help                       This help.
+
+${c_bold}UNINSTALL${c_reset}
+  --uninstall is safe to run repeatedly and does not touch Cocoa-Way,
+  waypipe, XQuartz or Homebrew itself -- only the things this project made.
+  To reproduce a from-scratch install:
+
+    ./qq.sh --uninstall --purge     # back to a pristine checkout
+    ./qq.sh --build                 # rebuild and run
 
 ${c_bold}ENVIRONMENT${c_reset}
   Every option has a QQ_-prefixed environment equivalent, e.g.
@@ -226,6 +243,8 @@ while [ $# -gt 0 ]; do
         no-rosetta) QQ_ROSETTA=0 ;;
         ime)        QQ_ENABLE_IME=1 ;;
         build)      QQ_BUILD=1 ;;
+        uninstall)  QQ_UNINSTALL=1 ;;
+        purge)      QQ_PURGE=1 ;;
         dry-run)    QQ_DRY_RUN=1 ;;
         help)       usage; exit 0 ;;
         # values
@@ -487,6 +506,176 @@ printf '  name      : %s\n' "$QQ_NAME" >&2
 printf '  resources : %s cpus, %s ram, %s shm\n' "$QQ_CPUS" "$QQ_MEMORY" "$QQ_SHM_SIZE" >&2
 printf '  ime       : %s\n' "$([ "$QQ_ENABLE_IME" = 1 ] && echo on || echo off)" >&2
 printf '\n' >&2
+
+# ---------------------------------------------------------------------------
+# uninstall
+#
+# Reverses everything this project creates, newest-first, and is deliberately
+# conservative: it only removes things it can prove belong to this project, and
+# it never touches the shared tooling (Cocoa-Way, waypipe, XQuartz, Homebrew).
+#
+# Artefacts, and why each needs its own step:
+#   1. the Cocoa-Way session -- only cocoa-wayctl can end it; killing the
+#      container behind its back leaves the session believing it still runs.
+#      It cannot be removed from the config file alone either, because
+#      Cocoa-Way may be holding it in memory.
+#   2. the container(s) it owns, named cocoa-way-<session>. A bare
+#      `container delete qq-amd64-wayland` misses them entirely.
+#   3. the images, for every arch this project tags (mac-qq-docker:amd64,
+#      :arm64, :latest).
+#   4. the generated [[session]] block in container-sessions.toml.
+#   5. scratch state under /tmp (transport sockets, logs, the legacy
+#      cocoa-way-qq runtime dir).
+#
+# ./QQ and ./shared are USER DATA (chat history, downloads) -- 488MB and 179MB
+# on this machine -- so they survive unless --purge is explicit.
+# ---------------------------------------------------------------------------
+do_uninstall() {
+    printf '%s==> uninstalling Linux QQ (project artefacts only)%s\n' "$c_bold" "$c_reset" >&2
+
+    local sessions session container_name
+
+    # --- 1. Cocoa-Way sessions -------------------------------------------
+    # Ask Cocoa-Way which sessions exist rather than trusting $QQ_NAME: the
+    # launcher names them after the arch (qq-amd64-wayland), so guessing the
+    # default name silently leaves the real session running.
+    local cwctl=""
+    command -v cocoa-wayctl >/dev/null 2>&1 && cwctl="$(command -v cocoa-wayctl)"
+
+    if [ -n "$cwctl" ]; then
+        sessions="$("$cwctl" --json applications 2>/dev/null \
+            | tr ',' '\n' \
+            | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' \
+            | grep '^qq' | sort -u || true)"
+        # Also honour an explicitly requested name, in case the session is
+        # tracked but not currently listed as an application.
+        case " $sessions " in
+            *" $QQ_NAME "*) ;;
+            *) sessions="$sessions
+$QQ_NAME" ;;
+        esac
+
+        for session in $sessions; do
+            [ -n "$session" ] || continue
+            if "$cwctl" --json stop "$session" >/dev/null 2>&1; then
+                step "stopped Cocoa-Way session '$session'"
+            fi
+        done
+    else
+        warn "cocoa-wayctl not found; skipping session shutdown"
+    fi
+
+    # --- 2. containers ----------------------------------------------------
+    # Both the bare name (X11 / lima paths) and cocoa-way-<name> (Wayland).
+    if command -v container >/dev/null 2>&1; then
+        for container_name in $(container list -a --format '{{.Names}}' 2>/dev/null \
+                                | grep -E "^(cocoa-way-)?${QQ_NAME}$" || true); do
+            container stop "$container_name" >/dev/null 2>&1 || true
+            if container delete "$container_name" >/dev/null 2>&1; then
+                step "removed container '$container_name'"
+            else
+                warn "could not remove container '$container_name'"
+            fi
+        done
+        # Any other QQ container Cocoa-Way may have left behind.
+        for container_name in $(container list -a --format '{{.Names}}' 2>/dev/null \
+                                | grep -E '^(cocoa-way-)?qq-' || true); do
+            container stop "$container_name" >/dev/null 2>&1 || true
+            container delete "$container_name" >/dev/null 2>&1 \
+                && step "removed leftover container '$container_name'"
+        done
+
+        # --- 3. images ---------------------------------------------------
+        local img
+        for img in "mac-qq-docker:amd64" "mac-qq-docker:arm64" "mac-qq-docker:latest"; do
+            if container image list 2>/dev/null | grep -q "${img%%:*}"; then
+                if container image delete "$img" >/dev/null 2>&1; then
+                    step "removed image '$img'"
+                fi
+            fi
+        done
+    fi
+
+    # --- 4. the generated session block ----------------------------------
+    local cfg="$HOME/.config/cocoa-way/container-sessions.toml"
+    if [ -f "$cfg" ]; then
+        local py=""
+        for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+            [ -x "$cand" ] && "$cand" -c 'import tomllib' 2>/dev/null && { py="$cand"; break; }
+        done
+        if [ -n "$py" ]; then
+            if "$py" - "$cfg" "$QQ_NAME" <<'PY'
+import re, sys
+path, name = sys.argv[1], sys.argv[2]
+import tomllib  # noqa: F401  (proves this interpreter can parse TOML)
+src = open(path, encoding="utf-8").read()
+blocks = re.split(r'(?m)^(?=\[\[session\]\])', src)
+out, removed = [], 0
+for b in blocks:
+    if b.startswith("[[session]]") and re.search(r'(?m)^name\s*=\s*"%s"\s*$' % re.escape(name), b):
+        removed += 1
+        continue
+    out.append(b)
+if removed:
+    open(path, "w", encoding="utf-8").write("".join(out))
+sys.exit(0 if removed else 1)
+PY
+            then
+                step "removed [[session]] '$QQ_NAME' from container-sessions.toml"
+            fi
+        else
+            warn "no python3 with tomllib; leaving $cfg untouched"
+        fi
+    fi
+
+    # --- 5. scratch state -------------------------------------------------
+    rm -rf /tmp/cocoa-way-qq 2>/dev/null && step "removed /tmp/cocoa-way-qq"
+    # Only our own transport dirs; a bare /tmp/cw-* would hit other tooling.
+    rm -rf /tmp/cw-501-* 2>/dev/null || true
+
+    # --- 6. user data (opt-in) --------------------------------------------
+    if [ "$QQ_PURGE" = "1" ]; then
+        for d in "$PROJECT_DIR/QQ" "$PROJECT_DIR/shared"; do
+            if [ -e "$d" ]; then
+                rm -rf "$d" && step "purged $d"
+            fi
+        done
+        rm -f "$PROJECT_DIR/.env" "$PROJECT_DIR/.x11-cookie" 2>/dev/null || true
+        rm -rf "$PROJECT_DIR/.x11-auth" 2>/dev/null || true
+    else
+        printf '\n  kept user data: %s (%s) and %s (%s)\n' \
+            "$PROJECT_DIR/QQ" "$(du -sh "$PROJECT_DIR/QQ" 2>/dev/null | cut -f1)" \
+            "$PROJECT_DIR/shared" "$(du -sh "$PROJECT_DIR/shared" 2>/dev/null | cut -f1)" >&2
+        printf '  add --purge to delete them too\n' >&2
+    fi
+
+    printf '\n%s==> uninstall complete%s\n' "$c_bold" "$c_reset" >&2
+}
+
+if [ "$QQ_PURGE" = "1" ] && [ "$QQ_UNINSTALL" != "1" ]; then
+    die "--purge only makes sense together with --uninstall"
+fi
+
+if [ "$QQ_UNINSTALL" = "1" ]; then
+    if [ "$QQ_DRY_RUN" = "1" ]; then
+        # --dry-run must stay side-effect free, so list what would go instead
+        # of removing it.
+        info "dry run: would uninstall"
+        printf '  stop and forget Cocoa-Way session(s) matching qq*\n' >&2
+        printf '  remove containers matching (cocoa-way-)qq*\n' >&2
+        printf '  remove images mac-qq-docker:{amd64,arm64,latest}\n' >&2
+        printf '  remove the [[session]] block for %s from container-sessions.toml\n' "$QQ_NAME" >&2
+        printf '  remove /tmp/cocoa-way-qq and /tmp/cw-501-*\n' >&2
+        if [ "$QQ_PURGE" = "1" ]; then
+            printf '  purge ./QQ and ./shared (user data)\n' >&2
+        else
+            printf '  keep ./QQ and ./shared (pass --purge to delete)\n' >&2
+        fi
+        exit 0
+    fi
+    do_uninstall
+    exit 0
+fi
 
 if [ "$QQ_DRY_RUN" = "1" ]; then
     info "dry run: not launching"
