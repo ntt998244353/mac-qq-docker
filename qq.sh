@@ -189,6 +189,9 @@ ${c_bold}EXAMPLES${c_reset}
 
   ${c_dim}# use whatever the distro repo ships (not Tencent's official build)${c_reset}
   ./$SELF --pkg apt
+
+  ${c_dim}# reproduce a from-scratch install (see docs/clean-install.md)${c_reset}
+  ./$SELF --uninstall && ./$SELF --build
 EOF
 }
 
