@@ -1,31 +1,34 @@
-# Wayland 模式故障排查（白屏闪退）
+# Wayland 模式故障排查
 
-> **先读这一段。** 下面记录的三个 bug 都是真的，也都已修好，但它们只让 QQ
-> **不再崩溃**，并**没有**让它显示出来。
+> **已修复（`88e8c84`）。** 下文列出的三个 bug 都是真的、也都已修好，但它们只
+> 让 QQ **不再崩溃**，**并未**让它显示出来。真正的原因是架构性的：
 >
-> `wayland-launch.sh` 把 waypipe 直接接到 Cocoa-Way 的内部 socket
-> `wayland-1` 上，而 Cocoa-Way **只呈现通过它自己的控制 API 分配出来的
-> 会话显示（session display）**。结果就是：QQ 的帧确实送到了 relay，
-> 然后被静默丢弃 —— 不报错、不崩溃，只是屏幕上什么都没有。
+> `wayland-launch.sh` 原先自己拼 transport（`wl/wl-transport.pl` +
+> `wl/host-relay.pl`），把 waypipe 直接接到 Cocoa-Way 的 socket 上。但
+> **Cocoa-Way 只呈现由它自己的启动器创建的会话**：
 >
-> 对比证据（同一台机器、同一时刻）：
+> | 列表 | 含义 |
+> | --- | --- |
+> | `displays.managed[]` | 已存在的显示。用 `display-create` 创建的显示会永远停在这里，`"status":"free","attachments":0` —— 因为附件数是 `active_sessions.filter(s.display_slot == slot).count()`，即只数 **Cocoa-Way 自己的会话**。外部 waypipe 接到这种显示上会连得上、帧传得过去、**什么都不显示，且无任何报错**。 |
+> | `displays.active[]` | 有活跃会话接入的显示，即“真的在屏幕上”。只有 `cocoa-wayctl launch` 能把会话放进这里。 |
 >
-> | | `./qq.sh`（无窗口） | `cocoa-wayctl launch QQ`（有窗口） |
-> | --- | --- | --- |
-> | `cocoa-wayctl displays` → `active` | **`[]`** | `[{display_slot: "rootless-qq", display_pid: …, waypipe_pid: …}]` |
-> | waypipe client 连到 | 无（只有自己的 listener fd） | 每会话 socket `qq-<id>.sock-client-*.sock` |
-> | QQ 窗口 | 不呈现 | 呈现 |
+> 因此现在 `wayland-launch.sh` 不再自己拼 transport：它向
+> `~/.config/cocoa-way/container-sessions.toml` 写入一个 `[[session]]` 块
+> （marker 包裹，不改动用户已有的 session），然后调用
+> `cocoa-wayctl launch`，把整个会话交给 Cocoa-Way。
 >
-> 也就是说：**能显示的那条路走的是 Cocoa-Way 的会话机制
-> （`presentation = "rootless"` + `profile = "single-app"`，由 compositor
-> 分配 display slot），而 `wayland-launch.sh` 自己另写了一套并行的
-> transport（`wl/wl-transport.pl` + `wl/host-relay.pl`），完全绕开了这套机制。**
-> 它从不调用 `cocoa-wayctl` / `control.sock`（`grep` 结果为 0）。
+> 判断“到底有没有显示出来”，**必须**看 `active`，不能看进程数或窗口列表：
 >
-> 要让 `qq.sh` 真正显示窗口，得让它走 Cocoa-Way 的会话/控制 API，而不是
-> 自己拼 transport。这一步**尚未完成**。
+> ```bash
+> cocoa-wayctl --json displays     # active 必须非空
+> ```
 
-## 症状
+## 已修复的三个 bug：白屏闪退
+
+（以下描述的是“会话直接崩掉”这个已修问题。修完后呈现的是“不崩但无窗口”，
+见上文。）
+
+### 症状
 
 Wayland 模式下 `./qq.sh --display wayland` 启动后，窗口出现约一秒的**白屏**，
 随后整个会话退出，日志尾部只有一句：
@@ -129,18 +132,31 @@ ERROR:third_party/crashpad/crashpad/util/file/file_io_posix.cc:153]
 ## 验证方式
 
 不要只看进程活没活着，也不要拿 `fps` / `commits_per_second` 当判据 ——
-空转的窗口本来就可能是 0。以**窗口服务器查询**为准：
+空转的窗口本来就可能是 0。判据分两层：
+
+**1）到底有没有显示出来（最重要）** —— 直接问 compositor：
 
 ```bash
-./windows.sh          # 应能看到 QQ 自己的窗口（如「控制中心」）
+cocoa-wayctl --json displays
+# active 必须非空，形如 {"display_slot":"rootless-qq-..."}
+# managed 里不应残留 status=free / attachments=0 的孤儿显示
+```
+
+**2）应用确实在跑：**
+
+```bash
+./windows.sh     # 应能看到 QQ 自己的窗口（如「控制中心」）
 ```
 
 一次健康的 Wayland 启动应当同时满足：
 
 | 检查项 | 期望值 |
 | --- | --- |
-| `container ls` | 容器处于 running |
-| `container exec <name> pgrep -c qq` | 5（而非 0） |
+| `cocoa-wayctl displays` → `active` | **非空**（这是唯一真正的“显示出来了”的判据） |
+| `cocoa-wayctl displays` → `managed` | 无 `free`/`attachments:0` 的孤儿显示 |
+| `cocoa-wayctl applications` | 本会话 `state` = `Running` |
+| 容器名 | `cocoa-way-<会话名>`（现在是 Cocoa-Way 拥有容器，不再叫 `qq-*-wayland`） |
+| `container exec cocoa-way-<会话名> pgrep -c qq` | 5（而非 0） |
 | 日志中 `forcing software GL` | 出现 1 次 |
 | 日志中 `Gtk-ERROR` | 0 |
 | 日志中 `waypipe internal error` | 0 |
@@ -166,7 +182,7 @@ ERROR:third_party/crashpad/crashpad/util/file/file_io_posix.cc:153]
 
 ## 还有一个假象：进程活着 ≠ 有窗口
 
-修完上面三点后，会话不再崩溃，`pgrep -c qq` 也能数到 5 个进程，
+修完崩退三点后，会话不再崩溃，`pgrep -c qq` 也能数到 5 个进程，
 `windows.sh` 里甚至能看到一个 `cocoa-way 800x632` 的窗口 —— 但那**是
 compositor 自己的空窗口**，不是 QQ。
 
