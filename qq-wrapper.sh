@@ -75,9 +75,16 @@ ARGS+=(--disable-gpu --disable-gpu-compositing)
 # NB: do NOT also pass --disable-software-rasterizer -- without it Chromium
 # falls back to its own SwiftShader software path instead of failing outright.
 ARGS+=(--in-process-gpu)
-# Make sure Chromium never depends on the tiny /dev/shm. The launcher raises it
-# with --shm-size; keep the disk-backed fallback as a belt-and-braces guarantee.
-ARGS+=(--disable-dev-shm-usage)
+# --- dev/shm ----------------------------------------------------------------
+# /dev/shm is a 64 MiB tmpfs by default, which is too small for Chromium's
+# shared-memory buffers, so upstream passes --disable-dev-shm-usage to fall back
+# to disk-backed /tmp. We instead raise the real thing with --shm-size (see
+# runtime_args), which is strictly better, so the flag is NOT passed.
+#
+# Note this differs from an earlier revision whose comment claimed the flag was
+# kept "because that is what the known-good Wayland session ran with": it was
+# never actually passed there (no ARGS+= line existed), and the proven-good
+# Wayland session ran without it. Do not add it back without evidence.
 
 if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
     # Wayland must NOT reuse the X11 flag set above. --disable-gpu drops
@@ -95,11 +102,18 @@ if [ "${QQ_DISPLAY_BACKEND:-x11}" = "wayland" ]; then
     # through wl_shm, which needs no DRM render node and no dmabuf -- exactly
     # right for a guest with no /dev/dri.
     #
-    # Strip the X11 GPU flags and leave the choice to Chromium.
+    # Keep --in-process-gpu. It is what stops the GPU work from becoming a
+    # separate Wayland client that can die on its own and take the display
+    # connection down with it ("ContextResult::kFatalFailure: WebGL1
+    # blocklisted" is logged either way, but only out-of-process does it kill
+    # the session). The proven-good session ran --in-process-gpu, so removing
+    # it is a regression, not a fix.
+    #
+    # Strip only the two flags that actually prevent painting.
     _kept=()
     for _a in "${ARGS[@]}"; do
         case "$_a" in
-            --disable-gpu|--disable-gpu-compositing|--in-process-gpu) ;;
+            --disable-gpu|--disable-gpu-compositing) ;;
             *) _kept+=("$_a") ;;
         esac
     done
