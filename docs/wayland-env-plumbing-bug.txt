@@ -1,0 +1,97 @@
+QQ_EXTRA_ARGS never reaches the guest
+=====================================
+
+Impact: every attempt to test a Chromium flag combination through
+`QQ_EXTRA_ARGS=... ./qq.sh ...` was testing nothing. The variable is written
+to the session TOML and then silently dropped before `container run`, so QQ
+always ran with the hardcoded flag set. Any conclusion drawn from those runs
+about `--in-process-gpu`, `--disable-gpu`, etc. is void.
+
+Where it goes wrong
+-------------------
+1. wayland-launch.sh does write it (line 183):
+
+       if [ -n "$EXTRA_ARGS" ]; then
+           echo "  \"QQ_EXTRA_ARGS=$(toml_escape "$EXTRA_ARGS")\","
+       fi
+
+2. The TOML on disk is correct and parses. With
+   QQ_EXTRA_ARGS="--no-first-run" the session's env array ends:
+
+       [..., 'QQ_ENABLE_IME=0', 'QQ_EXTRA_ARGS=--no-first-run']
+
+3. But the actual `container run` argv stops one entry earlier. Every other
+   variable we set is forwarded, and then the list jumps straight to the
+   proxy variables Cocoa-Way adds itself:
+
+       --env XDG_RUNTIME_DIR=/tmp/cocoa-way-runtime   <- hardcoded by Cocoa-Way
+       --env QQ_DISPLAY_BACKEND=wayland
+       --env ELECTRON_OZONE_PLATFORM_HINT=wayland
+       --env GDK_BACKEND=wayland
+       --env QT_QPA_PLATFORM=wayland
+       --env LIBGL_ALWAYS_SOFTWARE=1
+       --env GALLIUM_DRIVER=llvmpipe
+       --env MESA_LOADER_DRIVER_OVERRIDE=swrast
+       --env QQ_ENABLE_IME=0
+       --env HTTP_PROXY=socks5://192.168.64.1:51794     <- Cocoa-Way's own
+       ...
+
+   QQ_EXTRA_ARGS is not there.
+
+4. Consistent with that, nothing inside the guest has it. Scanning every
+   process:
+
+       for p in /proc/[0-9]*; do
+           tr '\0' '\n' < $p/environ | grep -qa QQ_EXTRA_ARGS && echo $p
+       done
+
+   finds no holder -- not tini, not the browser.
+
+This is not about the value's shape. Both a value containing an `=` and a
+space (`--disable-features=DrmBlob --enable-features=UseOzonePlatform`) and a
+bare one (`--no-first-run`) were dropped.
+
+Relevant Cocoa-Way code (container_sessions.rs)
+-----------------------------------------------
+The env array is handed to the relay as one newline-joined variable:
+
+    2284   .env(RELAY_ENV_LIST_ENV, session.env.join("\n"))
+
+and read back with:
+
+    836    fn relay_env_list(name: &str) -> Vec<String> {
+               std::env::var(name).ok()
+                   .map(|value| value.lines().map(str::trim)
+                       .filter(|line| !line.is_empty())
+                       .map(str::to_string).collect())
+                   .unwrap_or_default()
+           }
+
+and forwarded to the container here (run_publish_socket_relay, ~line 445):
+
+    for env in environment {
+        if !env.starts_with("XDG_RUNTIME_DIR=") {      // only this is filtered
+            cmd.arg("--env").arg(env);
+        }
+    }
+
+By inspection the filter only excludes XDG_RUNTIME_DIR, so QQ_EXTRA_ARGS
+should survive; empirically it does not. The loss therefore happens
+somewhere in the waypipe/relay environment handoff, which has not been
+pinned down yet. Not pursued further because it is no longer on the critical
+path (see below).
+
+What this means for the real bug
+--------------------------------
+The renderer is missing WAYLAND_DISPLAY. That is not caused by the flags, and
+the flags cannot be used to investigate it until this plumbing is fixed.
+
+To test flags without the broken channel, set them in the image itself (edit
+qq-wrapper.sh) and rebuild, or pass them through a variable Cocoa-Way does
+forward -- everything except XDG_RUNTIME_DIR is forwarded reliably, so
+QQ_ENABLE_IME-style plumbing (i.e. a dedicated new variable read by
+qq-wrapper.sh) would work.
+
+Note also that XDG_RUNTIME_DIR can never be overridden this way: Cocoa-Way
+always appends its own hardcoded value and explicitly skips any
+XDG_RUNTIME_DIR from the session's env list.

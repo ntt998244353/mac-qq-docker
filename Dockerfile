@@ -171,8 +171,17 @@ RUN chmod +x /home/user/entrypoint.sh /home/user/qq-wrapper.sh
 
 USER user
 WORKDIR /home/user
+# HOME and the IME variables are baked in because they are correct for the X11
+# path and for the interactive `container run` case. DISPLAY deliberately is
+# NOT: Apple `container` injects the real value (the vmnet gateway) at start,
+# and baking a bogus ":0" only serves to leak into the Wayland path, where a
+# leftover DISPLAY makes GTK/Chromium pick X11 and die with
+#   "Can't create a GtkStyleContext without a display connection".
+#
+# The IME variables are likewise only *defaults*: they point GTK/Qt at fcitx,
+# and if fcitx is not actually running the GTK immodule still gets loaded and
+# fails. entrypoint.sh and qq-wrapper.sh override them per backend.
 ENV HOME=/home/user \
-    DISPLAY=:0 \
     XAUTHORITY=/home/user/.Xauthority \
     GTK_IM_MODULE=fcitx \
     QT_IM_MODULE=fcitx \

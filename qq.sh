@@ -638,13 +638,14 @@ PY
 
     # --- 6. user data (opt-in) --------------------------------------------
     if [ "$QQ_PURGE" = "1" ]; then
-        for d in "$PROJECT_DIR/QQ" "$PROJECT_DIR/shared"; do
-            if [ -e "$d" ]; then
-                rm -rf "$d" && step "purged $d"
-            fi
-        done
-        rm -f "$PROJECT_DIR/.env" "$PROJECT_DIR/.x11-cookie" 2>/dev/null || true
-        rm -rf "$PROJECT_DIR/.x11-auth" 2>/dev/null || true
+        printf '\n  Purge was disabled\n'
+#        for d in "$PROJECT_DIR/QQ" "$PROJECT_DIR/shared"; do
+#            if [ -e "$d" ]; then
+#                rm -rf "$d" && step "purged $d"
+#            fi
+#        done
+#        rm -f "$PROJECT_DIR/.env" "$PROJECT_DIR/.x11-cookie" 2>/dev/null || true
+#        rm -rf "$PROJECT_DIR/.x11-auth" 2>/dev/null || true
     else
         printf '\n  kept user data: %s (%s) and %s (%s)\n' \
             "$PROJECT_DIR/QQ" "$(du -sh "$PROJECT_DIR/QQ" 2>/dev/null | cut -f1)" \

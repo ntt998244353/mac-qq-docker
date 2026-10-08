@@ -444,6 +444,70 @@ ERROR: vkCreateInstance failed with ERROR_OUT_OF_HOST_MEMORY
   <https://gitlab.freedesktop.org/slp/mesa/-/commit/761ef1ec5ff2aae1cc3dc8bbc22b3d06ef04b549>
   （注：仅改 `vn_ring.c` 能过 `vkCreateInstance`，但接着会在设备内存分配时再失败。）
 
+##### 后续：补丁已实测——16 KiB bug 确实修好了，但 Venus 仍然不可用
+
+本项目按上面的 workaround **实际重编了 guest Mesa**（Mesa 25.2.8，4 处 hunk 全部应用，
+只编 `-Dvulkan-drivers=virtio`），并在 VM 里重测。结论是：**补丁有效，但不够**。
+
+- **16 KiB 对齐 bug —— 已确认修好。** 把宿主 krunkit 提到 trace 级别
+  （`--krun-log-level 5`，lima 写死 3，用一个 shim 覆盖）后可以看到宿主侧的 blob 映射：
+
+  ```
+  virtio_gpu] mapping: map_ptr=103c30000, guest_addr=280000000, size=147456
+  vstate]    add_mapping: host_addr=103c30000, guest_addr=280000000, len=147456   <- 成功
+  virtio_gpu] mapping: map_ptr=108674000, guest_addr=280024000, size=1048576
+  vstate]    add_mapping: host_addr=108674000, guest_addr=280024000, len=1048576  <- 成功
+  ```
+
+  `147456 = 9 × 16384`（补丁前是 `135168 = 33 × 4096`，非对齐 → `hv_vm_map` 拒绝）。
+  整轮测试 **零** `vstate] Error adding/removing memory map`（打补丁前每轮 11 次失败）。
+  宿主内核报错 `response 0x1200 (command 0x208/0x209)` 也消失了。
+
+- **进展对比：**
+
+  | | 打补丁前 | 打补丁后 |
+  | --- | --- | --- |
+  | `vkCreateInstance` | `VK_ERROR_OUT_OF_HOST_MEMORY` | **`VK_SUCCESS` (0)** |
+  | 宿主 blob 映射 | 11 次 `MemoryMap` 失败 | **全部成功** |
+  | wire-format / 协议版本协商 | 卡在 ring shmem 分配 | **通过** |
+
+- **但出现了第二个、独立的上游缺陷：**
+
+  ```
+  vkEnumeratePhysicalDevices(count) = -3, n=0      # VK_ERROR_INITIALIZATION_FAILED
+  ```
+
+  - 失败点全在 **guest 用户态**：`vn_call_vkEnumeratePhysicalDeviceGroups()` 这一步。
+    guest `dmesg` **完全静默**（无任何 `virtio_gpu` 报错）→ 不是传输层问题。
+  - 宿主侧 libkrun trace **也没有任何报错**；rutabaga **没有**打出
+    “Failed to create virtio_gpu backend ... Falling back to safe defaults”，
+    说明 GPU 后端是按请求正常建起来的。
+  - 关键：`VIRGL_LOG_FILE=/tmp/virgl-venus.log`（配 `VIRGL_LOG_LEVEL=debug`）
+    **文件从未被创建** → `virgl_log_init()` 从未执行 → 宿主的 Venus 渲染器
+    根本没走到 `vkr_*` 上下文路径，也就是说 **virglrenderer-krun 0.10.4e 里那套
+    宿主侧 Venus 实现没有成功应答 `vkEnumeratePhysicalDeviceGroups`**。
+
+  → **结论：issue #114 的 16 KiB 对齐是必要条件，但不充分。**
+
+- 宿主栈已逐一验证健康：`virglrenderer-krun 0.10.4e` 直接链接 `libMoltenVK.dylib`
+  （Venus 符号 `_vkr_context_add_instance`、`_vkr_allocator_*` 确实编进去了），
+  且宿主 MoltenVK 本身可用：
+
+  ```
+  VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json vulkaninfo --summary
+  -> Vulkan Instance Version: 1.4.363   （正常枚举）
+  ```
+
+  即**宿主 Vulkan 没问题，问题出在 guest↔host 的 Venus 协议实现**。
+
+- 复现环境已保留（细节记录见 `docs/krunkit-venus-patched-mesa-result.txt`）：
+  krunkit trace shim 在 `/tmp/krunkit-shim/krunkit`；启动方式
+  `env PATH="/tmp/krunkit-shim:$PATH" VKR_DEBUG=1 VIRGL_LOG_LEVEL=debug \
+     VIRGL_LOG_FILE=/tmp/virgl-venus.log limactl start qq-gpu-test`；
+  guest 侧 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.json ~/vk_enum`。
+  （注意 guest 的 `/tmp` 在重启后清空，源码要放 `$HOME`；原始库备份在
+  `/usr/lib/aarch64-linux-gnu/libvulkan_virtio.so.orig`。）
+
 #### 关于“Vulkan 可直接从 DRM 分配 GBM 并显示、不需要 GL/EGL”
 
 这个说法**本身是成立的**（`VK_EXT_image_drm_format_modifier` + `VK_KHR_display` /
@@ -456,9 +520,11 @@ ERROR: vkCreateInstance failed with ERROR_OUT_OF_HOST_MEMORY
   GL/EGL/GBM；就算 Vulkan 可用，也得 QQ/Chromium 主动走 Vulkan 后端（`--use-vulkan`）
   才谈得上受益。而 krunkit 用 `VIRGLRENDERER_NO_VIRGL` **把 OpenGL 路径关了**。
 
-> 补充：slp 另有一支下游 Mesa 补丁（见上）能修好 Venus。若你想继续追，最有价值的一步是在
-> guest 里用那支补丁重编 Mesa，然后 `vulkaninfo --summary` 看能否成功；能成功的话再谈
-> GBM/DRM。但即便如此，Electron 能否用上仍是另一个未验证的问题。
+> 补充：slp 那支下游 Mesa 补丁本项目**已经实测过了**（见上文“后续”小节）：16 KiB
+> 对齐 bug 确实被修好，`vkCreateInstance` 从 `OUT_OF_HOST_MEMORY` 变成 `VK_SUCCESS`，
+> 但随即卡在 `vkEnumeratePhysicalDevices` 返回 `VK_ERROR_INITIALIZATION_FAILED`——
+> 宿主侧 Venus 没能完成物理设备枚举。所以这条路的下一跳不在 Mesa，而在
+> **virglrenderer 的 Venus 实现**（或等上游修）。
 
 #### 即使 GPU 修好了，QQ 还有别的障碍
 
@@ -498,18 +564,18 @@ ERROR: vkCreateInstance failed with ERROR_OUT_OF_HOST_MEMORY
 | 路线 | 能否给 QQ 拿到 GPU | 阻断点 |
 | --- | --- | --- |
 | 现状（`container` + Wayland） | ❌ | VM 无 GPU，且无法加（无 API） |
-| lima `krunkit` | ❌（已实测） | 有 `/dev/dri`，但 **Venus 当前完全不可用**（上游 #114：ring shmem 16384 对齐 bug）；`KMS disabled`；`NO_VIRGL` 关了 GL；无 Rosetta |
+| lima `krunkit` | ❌（已实测，两轮） | 有 `/dev/dri`，但 **Venus 完全不可用**：修完上游 #114 的 16384 对齐 bug 后，仍卡在 `vkEnumeratePhysicalDevices` = `INITIALIZATION_FAILED`（宿主 Venus 不应答）；`KMS disabled`；`NO_VIRGL` 关了 GL；无 Rosetta |
 | GPU-over-IP | ❌ | `container` VM 无法加载 `virtio-lo` 内核模块 |
 
 另外补充一个对本项目**实际可用**的真相：即使 GPU 完全用不上，QQ 在 **cocoa-way** 下的渲染
 仍然正常——因为 Electron 会回退到软件 GL（`GLSurfaceEglReadbackWayland`，wl_shm readback）。
 这个“无 GPU”路径是目前已验证可用的方案，对聊天应用足够。
 
-上面这套步骤（`brew tap slp/krun && brew install krunkit`、起 krunkit VM、guest 里跑
-`vulkaninfo --summary`）本项目已经实际跑过一遍，结论就是“卡在 `vn_CreateInstance`”。
-若要继续拔，下一步只能是：**用 slp 的 Mesa 补丁在 guest 里重编 Mesa**，然后看
-`vulkaninfo --summary` 和 `vkcube` 能否成功；能成功再谈 GBM/DRM/KMS（目前 KMS 是关的）。
-在做到这一步之前，把 QQ 搬到 krunkit 不会带来任何 GPU 收益。
+上面整套步骤本项目已经**完整跑过两轮**：第一轮在未打补丁的 guest Mesa 上卡在
+`vn_CreateInstance`（`OUT_OF_HOST_MEMORY`，上游 #114）；第二轮按 workaround 重编了
+guest Mesa，`vkCreateInstance` 成功，但 `vkEnumeratePhysicalDevices` 返回
+`VK_ERROR_INITIALIZATION_FAILED`——宿主 Venus 渲染器没能应答设备枚举（细节见上文）。
+所以目前**两个上游缺陷叠加**，Venus 仍不可用。把 QQ 搬到 krunkit 不会带来任何 GPU 收益。
 
 ---
 
@@ -528,9 +594,10 @@ tldr：**你不需要为它换 arm64 包**。本项目之所以不切 arm64：
 
 1. 当前 x86_64 + Rosetta + cocoa-way Wayland 方案已经**实测可用**（cocoa-way 转发窗口可渲染、可交互）。
 2. Electron 的 x86_64→arm64 切换，QQ 登录态/缓存目录不通用，没必要为没收益的架构切换去折腾。
-3. 备选 GPU 加速方案（lima krunkit）虽有默认开启的 GPU，但**仅 Venus/Vulkan 专供**，
-   Electron 的显示合成（GL/EGL/GBM）能否用上尚未验证，而且搬过去还得配 Wayland/compositor，
-   原型成本很高（详见「### GPU 加速」）。
+3. 备选 GPU 加速方案（lima krunkit）虽有默认开启的 GPU，但那是 **Venus/Vulkan 专供**；
+   已实际重编 guest Mesa 验证过：即使修好上游 #114 的 16 KiB 对齐 bug，仍卡在物理设备
+   枚举（`VK_ERROR_INITIALIZATION_FAILED`），且 `KMS disabled`（无显示输出）、
+   `NO_VIRGL`（GL 路径关闭）、无 Rosetta。**实质上拿不到可用 GPU**，详见「### GPU 加速」。
 
 若未来你想用原生 arm64，把 `Dockerfile`/`run.sh` 里的 `--arch amd64 --rosetta` 换成
 `--arch arm64`，并把 apt 源/依赖换成 arm64 即可（仓库里没有内置这条路径，因为调通了毫无额外收益，
